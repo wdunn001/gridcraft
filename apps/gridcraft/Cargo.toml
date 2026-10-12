@@ -13,6 +13,12 @@ workspace = true
 [dependencies]
 gridcraft-engine = { workspace = true }
 gridcraft-ui-egui = { workspace = true }
+# Shared editing. A path dependency because craft-libs is its own repository
+# and is checked out beside this one; the relay protocol lives there so every
+# Craft app speaks the same wire format.
+craft-collab = { path = "../../../craft-libs/crates/collab", features = ["native-hub"] }
+# Only the relay client is async, and NativeHub needs a runtime to live on.
+tokio = { version = "1", features = ["rt-multi-thread"] }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11"] }
 egui = { workspace = true }
 serde_json = { workspace = true }
