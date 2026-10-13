@@ -52,7 +52,7 @@ fn env(key: &str) -> Option<String> {
 
 impl TokenSource for EnvToken {
     fn join(&self) -> Option<(String, String)> {
-        Some((env("CLOUDCRAFT_RELAY")?, env("CLOUDCRAFT_TOKEN")?))
+        Some((env("COLLABCRAFT_RELAY")?, env("COLLABCRAFT_TOKEN")?))
     }
 }
 

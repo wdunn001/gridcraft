@@ -372,13 +372,13 @@ fn main() -> eframe::Result<()> {
                     return Err("the app was already created".into());
                 };
                 SheetApp::setup_context_for_language(&cc.egui_ctx, app.ui.dark, app.ui.language);
-                // Open and Save against cloud storage, when a CloudCraft
+                // Open and Save against cloud storage, when a CollabCraft
                 // service is configured. Every call it makes blocks, so it
                 // runs on a worker and answers reach the window through an
                 // inbox. Without a service the application is local-only and
                 // offers nothing cloud-shaped.
                 app.services.cloud = cloud::service(cc.egui_ctx.clone());
-                app.share.connect(craft_ui::share::CloudCraft::from_fn(cloud::client));
+                app.share.connect(craft_ui::share::CollabCraft::from_fn(cloud::client));
                 if let Some(port) = control_port {
                     match control_server::start(port, cc.egui_ctx.clone()) {
                         Ok(rx) => app.control_rx = Some(rx),
@@ -391,7 +391,7 @@ fn main() -> eframe::Result<()> {
                 // as an ordinary single-user spreadsheet.
                 //
                 // A document named by the launcher, reached through
-                // CloudCraft, which signs in through the browser. Otherwise
+                // CollabCraft, which signs in through the browser. Otherwise
                 // the plain token in the environment, which is what a test
                 // harness supplies.
                 let link = match cloud::CloudToken::from_env() {

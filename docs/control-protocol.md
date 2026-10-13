@@ -43,7 +43,7 @@ Any other method name that is a command id (e.g. `home.bold`) runs that command.
 
 ### Cloud storage
 
-Everything reaches storage through the CloudCraft service, and every call to it
+Everything reaches storage through the CollabCraft service, and every call to it
 blocks, so these commands start the work and return at once. Poll `cloud.status`
 for the answer. It reports the account, what the provider can do, the folder
 being listed, any transfer in flight, a refused save, and where the open

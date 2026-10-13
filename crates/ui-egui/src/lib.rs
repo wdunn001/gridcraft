@@ -194,7 +194,7 @@ pub struct Services {
     pub open_async: Option<Box<dyn Fn()>>,
     /// Files delivered asynchronously (name, bytes), opened on the next frame.
     pub inbox: Option<Inbox>,
-    /// Cloud storage, reached through the CloudCraft service. `None` leaves
+    /// Cloud storage, reached through the CollabCraft service. `None` leaves
     /// the application local-only, and nothing cloud-shaped is offered
     /// anywhere in the interface. Every call to that service blocks, so the
     /// host runs them on a worker and answers arrive in an inbox (see

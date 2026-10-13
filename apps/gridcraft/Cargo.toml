@@ -17,13 +17,13 @@ gridcraft-ui-egui = { workspace = true }
 # and is checked out beside this one; the relay protocol lives there so every
 # Craft app speaks the same wire format.
 craft-collab = { path = "../../../craft-libs/crates/collab", features = ["native-hub"] }
-# How this app reaches CloudCraft. No provider credential, no provider URL
+# How this app reaches CollabCraft. No provider credential, no provider URL
 # and no provider protocol live in here.
 craft-cloud-client = { path = "../../../craft-libs/crates/cloud-client" }
 # The share dialog's backend. The dialog is drawn by gridcraft-ui-egui, which
-# opens no socket; this feature is the half that reaches CloudCraft, and it
+# opens no socket; this feature is the half that reaches CollabCraft, and it
 # lives here because the session this application collects lives here too.
-craft-ui = { path = "../../../craft-libs/crates/ui", features = ["cloudcraft"] }
+craft-ui = { path = "../../../craft-libs/crates/ui", features = ["collabcraft"] }
 # Only the relay client is async, and NativeHub needs a runtime to live on.
 tokio = { version = "1", features = ["rt-multi-thread"] }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11"] }

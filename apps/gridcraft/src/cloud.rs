@@ -1,11 +1,11 @@
-//! Talking to CloudCraft from this application.
+//! Talking to CollabCraft from this application.
 //!
 //! Two jobs live here. [`service`] starts the worker that Open and Save run
 //! on. [`CloudToken`] mints the relay token for shared editing. Both go
 //! through the same service and share one saved session.
 //!
 //! GridCraft holds no provider credential and speaks no provider protocol.
-//! Everything goes through the CloudCraft service, which is the one place a
+//! Everything goes through the CollabCraft service, which is the one place a
 //! provider is configured. This file supplies the transport half of
 //! `gridcraft_ui_egui::cloud` and the two things a desktop application has to
 //! do that a library cannot: open a browser, and decide how long to keep
@@ -29,13 +29,13 @@ use crate::collab::TokenSource;
 /// How long to keep polling a sign-in before giving up on it.
 const SIGN_IN_WAIT: Duration = Duration::from_secs(300);
 
-/// Where the CloudCraft service is.
+/// Where the CollabCraft service is.
 ///
 /// Read from the environment and compiled in nowhere, because the service is
 /// deployment-specific and a desktop binary must not carry one. Without it
 /// there is no cloud worker, and the interface offers nothing cloud-shaped.
 fn base_url() -> Option<String> {
-    ["GRIDCRAFT_CLOUD_URL", "CRAFT_CLOUD_URL", "CLOUDCRAFT_URL"]
+    ["GRIDCRAFT_CLOUD_URL", "CRAFT_CLOUD_URL", "COLLABCRAFT_URL"]
         .into_iter()
         .filter_map(|key| std::env::var(key).ok())
         .map(|value| value.trim().trim_end_matches('/').to_owned())
@@ -49,7 +49,7 @@ pub fn service(ctx: egui::Context) -> Option<CloudService> {
     let inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
     let (sender, receiver) = std::sync::mpsc::channel::<Job>();
     let worker_inbox = inbox.clone();
-    let started = std::thread::Builder::new().name("cloudcraft".to_owned()).spawn(move || {
+    let started = std::thread::Builder::new().name("collabcraft".to_owned()).spawn(move || {
         let token = load_token();
         let mut client = Client::new(&base);
         if let Some(token) = token {
@@ -194,7 +194,7 @@ impl Worker {
 
 /// A client error in the shapes the interface acts on differently.
 ///
-/// CloudCraft answers a refused conditional write with HTTP 409 and the code
+/// CollabCraft answers a refused conditional write with HTTP 409 and the code
 /// `conflict` (see its `api::fail`). The client crate carries that through as
 /// an ordinary refusal, so the code is read here and given its own shape. That
 /// is the one failure a save must never retry and never force: it means
@@ -233,7 +233,7 @@ pub fn client() -> Option<Client> {
 fn token_path() -> Option<PathBuf> {
     let dir = crate::config_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("cloudcraft-session.json"))
+    Some(dir.join("collabcraft-session.json"))
 }
 
 fn load_token() -> Option<String> {
@@ -295,7 +295,7 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 
 // ---------------------------------------------------------------- shared editing
 
-/// A [`TokenSource`] backed by the CloudCraft service.
+/// A [`TokenSource`] backed by the CollabCraft service.
 ///
 /// The service and the document come from the environment, because they are
 /// what an "Open in GridCraft" action in a cloud file list passes in. Neither
@@ -314,11 +314,11 @@ pub struct CloudToken {
 impl CloudToken {
     pub fn from_env() -> Option<CloudToken> {
         let base = base_url()?;
-        // CLOUDCRAFT_FILE is the canonical name. It is what the Nextcloud
+        // COLLABCRAFT_FILE is the canonical name. It is what the Nextcloud
         // "Open in …" deep link carries as `file`, and it holds the provider's
         // own handle for the document, which is opaque here. The others are
         // accepted so an older launcher keeps working.
-        let id = var("CLOUDCRAFT_FILE")
+        let id = var("COLLABCRAFT_FILE")
             .or_else(|| var("CRAFT_FILE_ID"))
             .or_else(|| var("CRAFT_DOCUMENT_ID"))?;
         Some(CloudToken { base, id })

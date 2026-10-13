@@ -1,12 +1,12 @@
 //! Open and Save against cloud storage.
 //!
 //! GridCraft holds no provider credential and speaks no provider protocol.
-//! Every call goes to the CloudCraft service. That service is the single place
+//! Every call goes to the CollabCraft service. That service is the single place
 //! a provider is configured and permissions are decided. Replacing Nextcloud
 //! with something else changes nothing in this file.
 //!
 //! This is the interface half of the work. The host application supplies the
-//! other half as [`crate::Services::cloud`], for two reasons. Every CloudCraft
+//! other half as [`crate::Services::cloud`], for two reasons. Every CollabCraft
 //! call blocks, and egui redraws at frame rate. A blocking read of a twenty
 //! megabyte workbook inside a frame would freeze the window for seconds. So
 //! the interface hands the host a [`Job`], the host runs it on a worker
