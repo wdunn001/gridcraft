@@ -26,12 +26,17 @@ use serde_json::Value as Json;
 /// was handed. Anything able to mint tokens could forge any file id and any
 /// permission bits, and that is why the key stays server-side.
 pub trait TokenSource {
-    /// The relay root, such as `http://192.168.1.88:9444`.
-    fn relay(&self) -> Option<String>;
-    /// An opaque signed token scoped to one file.
-    fn token(&self) -> Option<String>;
-    /// The name other peers see in the roster.
-    fn display(&self) -> String;
+    /// Where the relay is, and a signed token for one document.
+    ///
+    /// One call, because one call mints one token. Asking separately would
+    /// reach the service twice and burn a token on the first answer. They
+    /// belong together anyway: the service authorises the open and signs the
+    /// result in the same step, and it is the service that knows which relay
+    /// to use.
+    ///
+    /// The roster name is not asked for. The relay takes it from the token's
+    /// own claim, so a client cannot present itself as somebody else.
+    fn join(&self) -> Option<(String, String)>;
 }
 
 /// Reads the environment.
@@ -46,14 +51,8 @@ fn env(key: &str) -> Option<String> {
 }
 
 impl TokenSource for EnvToken {
-    fn relay(&self) -> Option<String> {
-        env("CRAFTCOLLAB_RELAY")
-    }
-    fn token(&self) -> Option<String> {
-        env("CRAFTCOLLAB_TOKEN")
-    }
-    fn display(&self) -> String {
-        env("CRAFTCOLLAB_DISPLAY").unwrap_or_else(|| "GridCraft".to_owned())
+    fn join(&self) -> Option<(String, String)> {
+        Some((env("CLOUDCRAFT_RELAY")?, env("CLOUDCRAFT_TOKEN")?))
     }
 }
 
@@ -141,6 +140,9 @@ pub struct Link {
     pub notices: Vec<String>,
     /// Who else is in the document, for the status bar.
     pub roster: Vec<String>,
+    /// The last connection state reported, so a change is announced once
+    /// rather than on every frame.
+    was_connected: bool,
 }
 
 impl Link {
@@ -150,8 +152,7 @@ impl Link {
     /// reached, and the app then behaves exactly as it did before. Shared
     /// editing is an addition, never a precondition for opening a file.
     pub fn attach(engine: &mut Engine, src: &dyn TokenSource) -> Option<Link> {
-        let relay = src.relay()?;
-        let token = src.token()?;
+        let (relay, token) = src.join()?;
         let Some(doc) = doc_from_token(&token) else {
             log::warn!("collab: the token carries no file id, so there is no room to join");
             return None;
@@ -181,20 +182,29 @@ impl Link {
         let (tx, local) = channel();
         engine.collab = Some(Arc::new(Outbound(tx)));
         log::info!("collab: joining {doc} on {relay}");
-        Some(Link { _rt: rt, hub, wire, local, notices: Vec::new(), roster: Vec::new() })
+        Some(Link { _rt: rt, hub, wire, local, notices: Vec::new(), roster: Vec::new(), was_connected: true })
     }
 
-    /// Whether the transport still believes it is connected.
-    pub fn connected(&self) -> bool {
-        self.hub.connected()
-    }
 
     /// One frame's work: send what the user did, apply what arrived.
     ///
     /// Called from the app's per-frame hook. Everything here is a channel
     /// operation, so no IO happens on the UI thread.
     pub fn pump(&mut self, engine: &mut Engine) {
-        // Outbound first, so a local edit is on its way before time goes on
+        // Say so when the link drops, and again when it comes back. An edit
+        // made while disconnected still applies locally and is still queued,
+        // so the user needs to know it has not reached anyone yet.
+        let now = self.hub.connected();
+        if now != self.was_connected {
+            self.notices.push(if now {
+                "reconnected to the other editors".to_owned()
+            } else {
+                "not connected to the other editors; your edits are waiting".to_owned()
+            });
+            self.was_connected = now;
+        }
+
+        // Outbound next, so a local edit is on its way before time goes on
         // applying remote ones.
         while let Ok((id, params)) = self.local.try_recv() {
             let scope = scope_of(&params);

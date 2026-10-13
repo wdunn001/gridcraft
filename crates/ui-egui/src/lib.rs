@@ -10,6 +10,7 @@ pub mod backstage;
 mod border_preview;
 mod cell_pictures;
 pub mod chartview;
+pub mod cloud;
 pub mod control;
 pub mod credits;
 pub mod dialogs;
@@ -193,6 +194,12 @@ pub struct Services {
     pub open_async: Option<Box<dyn Fn()>>,
     /// Files delivered asynchronously (name, bytes), opened on the next frame.
     pub inbox: Option<Inbox>,
+    /// Cloud storage, reached through the CloudCraft service. `None` leaves
+    /// the application local-only, and nothing cloud-shaped is offered
+    /// anywhere in the interface. Every call to that service blocks, so the
+    /// host runs them on a worker and answers arrive in an inbox (see
+    /// [`cloud`]).
+    pub cloud: Option<cloud::CloudService>,
     /// Web: hand PDF bytes to the browser's print flow directly (no download,
     /// no intermediate file) — opens the system print dialog on that PDF.
     pub print: Option<Box<dyn Fn(&[u8])>>,
@@ -218,6 +225,13 @@ pub struct SheetApp {
     pub dialog: Option<dialogs::Dialog>,
     /// The File tab's Backstage view, when open (UI-only; replaces the ribbon, grid and tabs).
     pub backstage: Option<backstage::Backstage>,
+    /// Open and Save against cloud storage: the account, the folder being
+    /// browsed, transfers in flight, and where each open document came from.
+    pub cloud: cloud::Cloud,
+    /// Giving other people access to this workbook. The dialog is `craft-ui`'s,
+    /// so every Craft app offers the same one. Inert until the host connects a
+    /// backend, and unavailable until that service says sharing exists.
+    pub share: craft_ui::share::ShareDialog,
     pub message: Option<(String, String)>,
     pub toast: Option<(String, f64)>,
     /// Dismissible info bar under the ribbon (open-time notices).
@@ -275,6 +289,8 @@ impl SheetApp {
             text_box_editor: None,
             dialog: None,
             backstage: None,
+            cloud: cloud::Cloud::default(),
+            share: craft_ui::share::ShareDialog::new(),
             message: None,
             toast: None,
             notice: None,
@@ -679,6 +695,81 @@ impl SheetApp {
                 self.notice = None;
                 Ok(Json::Null)
             }
+            // ---- cloud storage (File › Open, File › Save As)
+            //
+            // `file.save` is intercepted only for a workbook that came from
+            // the cloud and has no local file of its own, so saving a local
+            // workbook behaves exactly as it always did.
+            "file.save" if p.get("path").is_none() && cloud::has_target(self) => cloud::save(self),
+            "cloud.status" => Ok(cloud::status(self)),
+            "cloud.open" => {
+                if !cloud::available(self) {
+                    return Some(Err(cloud::UNAVAILABLE.to_owned()));
+                }
+                self.open_backstage(backstage::Page::Open);
+                cloud::start(self);
+                Ok(cloud::status(self))
+            }
+            "cloud.browse" => {
+                if !cloud::available(self) {
+                    return Some(Err(cloud::UNAVAILABLE.to_owned()));
+                }
+                let path = p.get("path").and_then(Json::as_str).unwrap_or("");
+                cloud::browse(self, path);
+                Ok(json!({"folder": path}))
+            }
+            "cloud.shared" => {
+                if !cloud::available(self) {
+                    return Some(Err(cloud::UNAVAILABLE.to_owned()));
+                }
+                cloud::load_shared(self);
+                Ok(Json::Null)
+            }
+            "cloud.link" => {
+                if !cloud::available(self) {
+                    return Some(Err(cloud::UNAVAILABLE.to_owned()));
+                }
+                cloud::link(self);
+                Ok(cloud::status(self))
+            }
+            // Opens something already listed, by id or by name. The listing is
+            // what the user can see, which keeps a scripted open and a clicked
+            // one on the same footing.
+            "cloud.openFile" => {
+                let id = p.get("id").and_then(Json::as_str);
+                let name = p.get("name").and_then(Json::as_str).unwrap_or("");
+                let found = self
+                    .cloud
+                    .mine
+                    .entries
+                    .iter()
+                    .chain(self.cloud.shared.entries.iter())
+                    .find(|e| id.is_some_and(|id| e.id == id) || (!name.is_empty() && e.name == name))
+                    .cloned();
+                match found {
+                    Some(entry) if cloud::opens(&entry) => {
+                        cloud::open_entry(self, entry, None);
+                        Ok(cloud::status(self))
+                    }
+                    Some(entry) => return Some(Err(format!("GridCraft cannot open {}", entry.name))),
+                    None => return Some(Err("no such file in the cloud listing".to_owned())),
+                }
+            }
+            "cloud.save" => cloud::save(self),
+            "cloud.saveAs" => match (p.get("folder").and_then(Json::as_str), p.get("name").and_then(Json::as_str)) {
+                (Some(folder), Some(name)) => cloud::save_as(self, folder, name),
+                _ => {
+                    if !cloud::available(self) {
+                        return Some(Err(cloud::UNAVAILABLE.to_owned()));
+                    }
+                    self.open_backstage(backstage::Page::SaveAs);
+                    if let Some(backstage) = &mut self.backstage {
+                        backstage.save_to_cloud = Some(true);
+                    }
+                    Ok(cloud::status(self))
+                }
+            },
+            "cloud.reload" => cloud::reload_active(self),
             _ => return None,
         };
         Some(r)
@@ -1056,6 +1147,8 @@ impl SheetApp {
             ctx.request_repaint();
         }
         control::poll(self, ctx);
+        // Answers from the cloud worker, and anything still in flight.
+        cloud::pump(self, ctx);
         // Files read asynchronously (web file picker, dropped files).
         let arrived: Vec<(String, Vec<u8>)> = self
             .services
@@ -1129,6 +1222,13 @@ impl SheetApp {
             });
         }
         dialogs::show(self, &ctx);
+        // Unconditional, because this is also where the share service's
+        // answers are collected, which has to keep happening while the dialog
+        // is shut.
+        self.share.show(&ctx);
+        // Above the message box: a refused save has to be answered, and the
+        // answer decides what happens to the user's edits.
+        cloud::conflict_modal(self, &ctx);
         widgets::message_box(self, &ctx);
         widgets::toast(self, &ctx);
         control::issue_screenshots(self, &ctx);

@@ -287,6 +287,15 @@ impl Session {
     pub fn active_mut(&mut self) -> Option<&mut DocState> {
         self.docs.get_mut(self.active)
     }
+    /// A document by its uid, active or not.
+    ///
+    /// For a caller holding an answer that outlived the frame it was asked
+    /// for. A cloud save lands after the bytes have travelled, and it belongs
+    /// to the document it was made from even when another window is active by
+    /// then.
+    pub fn document_mut(&mut self, uid: u64) -> Option<&mut DocState> {
+        self.docs.iter_mut().find(|d| d.uid == uid)
+    }
     pub fn doc(&self) -> Result<&DocState> {
         self.active().ok_or(EngineError::NoDocument)
     }

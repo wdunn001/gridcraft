@@ -129,19 +129,37 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
                 if __k.clicked() {
                     app.open_dialog("commandSearch", json!({}));
                 }
-                let share = small_button(ui, Icon::Share, "Share", "Share: export or save a copy", true);
-                egui::Popup::menu(&share).show(|ui| {
-                    if ui.button("Export as PDF…").clicked() {
-                        app.run_or_alert("file.exportPdf", json!({}));
+                // Share means share when there is somewhere to share to. The
+                // dialog itself lives in craft-ui, so every Craft app offers
+                // the same one. Without a service that reports sharing this
+                // falls back to the export menu the button used to be, rather
+                // than offering a share that would fail.
+                if app.share.available() {
+                    if small_button(ui, Icon::Share, "Share", "Share this workbook with other people", false).clicked() {
+                        // The handle the provider issued, which is what a share
+                        // is about. A workbook that has never been in the cloud
+                        // has none, and the dialog says so.
+                        let (id, title) = match crate::cloud::origin(app) {
+                            Some(origin) => (origin.entry.id.clone(), origin.entry.name.clone()),
+                            None => (String::new(), app.session.active().map(|d| d.display_title()).unwrap_or_default()),
+                        };
+                        app.share.open(id, title);
                     }
-                    for (label, fmt) in
-                        [("Save a Copy as Excel Workbook (.xlsx)…", "xlsx"), ("Export as CSV…", "csv"), ("Export as Web Page (.html)…", "html")]
-                    {
-                        if ui.button(label).clicked() {
-                            app.open_dialog("saveCopy", json!({"format": fmt}));
+                } else {
+                    let share = small_button(ui, Icon::Share, "Share", "Share: export or save a copy", true);
+                    egui::Popup::menu(&share).show(|ui| {
+                        if ui.button("Export as PDF…").clicked() {
+                            app.run_or_alert("file.exportPdf", json!({}));
                         }
-                    }
-                });
+                        for (label, fmt) in
+                            [("Save a Copy as Excel Workbook (.xlsx)…", "xlsx"), ("Export as CSV…", "csv"), ("Export as Web Page (.html)…", "html")]
+                        {
+                            if ui.button(label).clicked() {
+                                app.open_dialog("saveCopy", json!({"format": fmt}));
+                            }
+                        }
+                    });
+                }
                 let __k = icon_button(ui, Icon::Comment, t.text_dim, "Comments", vec2(28.0, ch));
                 control_keytip(app, ui, &__k, "comments");
                 if __k.clicked() {
