@@ -185,7 +185,6 @@ impl Link {
         Some(Link { _rt: rt, hub, wire, local, notices: Vec::new(), roster: Vec::new(), was_connected: true })
     }
 
-
     /// One frame's work: send what the user did, apply what arrived.
     ///
     /// Called from the app's per-frame hook. Everything here is a channel

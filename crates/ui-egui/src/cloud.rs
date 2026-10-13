@@ -60,6 +60,8 @@ pub enum Job {
     Write { uid: u64, entry: Entry, bytes: Vec<u8> },
     /// Save under a new name in `folder`.
     Create { uid: u64, folder: String, name: String, bytes: Vec<u8> },
+    /// End the session and forget the saved token.
+    SignOut,
 }
 
 /// What a worker reports back.
@@ -67,13 +69,26 @@ pub enum Event {
     Account(Result<Account, Fault>),
     /// A link or a sign-in needs the user's browser. `handle` is polled until
     /// they are done, when the service gave one.
-    Browser { url: String, handle: Option<String> },
+    Browser {
+        url: String,
+        handle: Option<String>,
+    },
     /// `Ok(true)` means the account is linked now.
     Linked(Result<bool, Fault>),
-    Listed { path: String, entries: Result<Vec<Entry>, Fault> },
+    Listed {
+        path: String,
+        entries: Result<Vec<Entry>, Fault>,
+    },
     Shared(Result<Vec<Entry>, Fault>),
-    Read { entry: Entry, into: Option<u64>, bytes: Result<Vec<u8>, Fault> },
-    Saved { uid: u64, entry: Result<Entry, Fault> },
+    Read {
+        entry: Entry,
+        into: Option<u64>,
+        bytes: Result<Vec<u8>, Fault>,
+    },
+    Saved {
+        uid: u64,
+        entry: Result<Entry, Fault>,
+    },
 }
 
 /// Answers waiting to be read by a frame.
@@ -231,7 +246,11 @@ pub enum Link {
     Offered,
     Starting,
     /// The browser is open. `handle` is polled until the user is done.
-    Waiting { url: String, handle: Option<String>, next_poll: f64 },
+    Waiting {
+        url: String,
+        handle: Option<String>,
+        next_poll: f64,
+    },
     Failed(Fault),
 }
 
@@ -300,6 +319,109 @@ pub fn start(app: &mut SheetApp) {
     if !app.cloud.mine.loaded && !app.cloud.mine.loading {
         browse(app, "");
     }
+}
+
+/// The host part of the service address, for the menu's first line.
+///
+/// Somebody with an account on two deployments needs to know which one a
+/// document is about to land in.
+fn service_host() -> String {
+    ["GRIDCRAFT_CLOUD_URL", "CRAFT_CLOUD_URL", "COLLABCRAFT_URL"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
+        .find(|value| !value.is_empty())
+        .map(|value| value.trim_start_matches("https://").trim_start_matches("http://").to_owned())
+        .unwrap_or_default()
+}
+
+/// The account badge, and the actions behind it.
+///
+/// Drawn only where a service is configured. A build with no service offers
+/// nothing cloud-shaped at all, and a badge that cannot sign anybody in would
+/// be a control that fails on use.
+pub fn account_badge(ui: &mut egui::Ui, app: &mut SheetApp) {
+    if !available(app) {
+        return;
+    }
+    // Nothing is asked for here. Drawing a badge must not begin a sign-in:
+    // the worker signs in before any job it is given, and it then blocks
+    // polling the browser for minutes. Starting that from a paint call pops a
+    // browser open at launch and leaves every later job queued behind it.
+    // Signing in is a gesture, so it waits for the press below.
+    let known = app.cloud.account.as_ref().map(|a| craft_ui::account::Account {
+        // One account for now. The control already holds a list, so a second
+        // deployment is a second entry here and nothing else changes.
+        id: "default".to_owned(),
+        display: a.display.clone(),
+        email: None,
+        service: service_host(),
+        linked: a.provider_linked,
+    });
+    app.account.set(known.into_iter().collect());
+    app.account.show(ui);
+
+    while let Some(action) = app.account.take_action() {
+        use craft_ui::account::AccountAction as Act;
+        match action {
+            // Signing in and connecting storage are two different things.
+            // Signing in is the device flow against the service, which every
+            // job already triggers when there is no token. Asking who the
+            // account is therefore starts it. Linking storage comes after,
+            // and needs that session to exist first.
+            Act::SignIn | Act::AddAccount => sign_in(app),
+            Act::Link(_) => link(app),
+            Act::SignOut(_) => sign_out(app),
+            // One account, so there is nothing to switch to yet.
+            Act::Use(_) => {}
+            Act::Manage(_) => {
+                let host = service_host();
+                if let Some(open) = &app.services.open_url
+                    && !host.is_empty()
+                {
+                    open(&format!("https://{host}/account"));
+                }
+            }
+        }
+    }
+}
+
+/// Begins signing in to the service.
+///
+/// The worker signs in before any job it is given, so asking who the account
+/// is starts the browser flow. The badge says it is working, because the
+/// worker then blocks until the user finishes in the browser and a button
+/// that looks idle for a minute reads as broken.
+pub fn sign_in(app: &mut SheetApp) {
+    if !available(app) {
+        return;
+    }
+    app.account.working();
+    app.cloud.account_fault = None;
+    // Cleared first. A sign-in that failed leaves this set, and a second press
+    // would then be swallowed by the guard that stops a frame asking twice.
+    // A button that does nothing the second time reads as a broken button.
+    app.cloud.asked_account = false;
+    app.cloud.link = None;
+    app.cloud.asked_account = true;
+    app.cloud.status = Some("Finish signing in, in your browser".to_owned());
+    submit(app, Job::Account);
+}
+
+/// Ends the session, here and at the service.
+///
+/// The saved token goes too. Forgetting the account on screen while leaving
+/// the token on disk would sign the user back in on the next run.
+pub fn sign_out(app: &mut SheetApp) {
+    app.cloud.account = None;
+    app.cloud.account_fault = None;
+    app.cloud.asked_account = false;
+    app.cloud.link = None;
+    app.cloud.mine = Folder::default();
+    app.cloud.shared = Folder::default();
+    app.cloud.origins.clear();
+    app.cloud.status = Some("Signed out".to_owned());
+    submit(app, Job::SignOut);
 }
 
 /// Lists one folder. An empty path is the user's root.
@@ -477,12 +599,8 @@ pub fn pump(app: &mut SheetApp, ctx: &egui::Context) {
     if !available(app) {
         return;
     }
-    let arrived: Vec<Event> = app
-        .services
-        .cloud
-        .as_ref()
-        .map(|c| std::mem::take(&mut *c.inbox.lock().unwrap_or_else(PoisonError::into_inner)))
-        .unwrap_or_default();
+    let arrived: Vec<Event> =
+        app.services.cloud.as_ref().map(|c| std::mem::take(&mut *c.inbox.lock().unwrap_or_else(PoisonError::into_inner))).unwrap_or_default();
     for event in arrived {
         apply(app, event);
     }
@@ -498,6 +616,11 @@ fn apply(app: &mut SheetApp, event: Event) {
     match event {
         Event::Account(Ok(account)) => {
             let linked = account.provider_linked;
+            // Who is signed in has changed, so what the provider can do
+            // may have changed with it. The dialog keeps its first
+            // answer, and on a cold start that answer is "nobody is
+            // signed in".
+            app.share.refresh();
             app.cloud.account = Some(account);
             app.cloud.account_fault = None;
             if linked {
@@ -522,6 +645,8 @@ fn apply(app: &mut SheetApp, event: Event) {
             app.cloud.link = Some(Link::Waiting { url, handle, next_poll: now_ms() + LINK_POLL_MS });
         }
         Event::Linked(Ok(true)) => {
+            // Storage just arrived, so ask what it can do.
+            app.share.refresh();
             app.cloud.link = None;
             app.cloud.status = Some("Cloud account linked.".to_owned());
             app.cloud.asked_account = false;
@@ -640,9 +765,8 @@ pub fn status(app: &SheetApp) -> Json {
             "capabilities": a.capabilities.iter().map(|c| serde_json::to_value(c).unwrap_or_default()).collect::<Vec<_>>(),
         })
     });
-    let came_from = origin(app).map(|o| {
-        json!({"id": o.entry.id, "room": o.entry.room, "name": o.entry.name, "etag": o.entry.etag, "writable": o.entry.writable})
-    });
+    let came_from = origin(app)
+        .map(|o| json!({"id": o.entry.id, "room": o.entry.room, "name": o.entry.name, "etag": o.entry.etag, "writable": o.entry.writable}));
     json!({
         "available": available(app),
         "account": account,
@@ -715,16 +839,11 @@ fn entry_row(ui: &mut Ui, entry: &Entry, detail: &str) -> egui::Response {
 /// by side.
 fn column(ui: &mut Ui, heading: &str, body: impl FnOnce(&mut Ui)) {
     let t = Tokens::get(ui.ctx());
-    egui::Frame::NONE
-        .fill(t.ribbon)
-        .stroke(Stroke::new(1.0, t.ribbon_border))
-        .corner_radius(6.0)
-        .inner_margin(10)
-        .show(ui, |ui| {
-            ui.label(RichText::new(heading).font(theme::ui_bold(13.0)).color(t.text));
-            ui.add_space(6.0);
-            egui::ScrollArea::vertical().id_salt(heading.to_owned()).max_height(300.0).auto_shrink([false, false]).show(ui, body);
-        });
+    egui::Frame::NONE.fill(t.ribbon).stroke(Stroke::new(1.0, t.ribbon_border)).corner_radius(6.0).inner_margin(10).show(ui, |ui| {
+        ui.label(RichText::new(heading).font(theme::ui_bold(13.0)).color(t.text));
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical().id_salt(heading.to_owned()).max_height(300.0).auto_shrink([false, false]).show(ui, body);
+    });
 }
 
 /// The account line, or the reason there is nothing to show yet.
@@ -787,6 +906,18 @@ fn link_panel(app: &mut SheetApp, ui: &mut Ui) -> bool {
                 dim(ui, lang.tr("Waiting for your browser…"));
             });
             ui.add_space(6.0);
+            // A link alone is not enough. When the browser cannot be opened,
+            // or opens the wrong thing, the only way out is carrying the
+            // address across by hand, and a label cannot be selected.
+            ui.horizontal(|ui| {
+                if ui.button(lang.tr("Open in browser")).clicked() {
+                    browse_to = Some(url.clone());
+                }
+                if ui.button(lang.tr("Copy link")).clicked() {
+                    ui.ctx().copy_text(url.clone());
+                }
+            });
+            ui.add_space(4.0);
             if ui.link(&url).clicked() {
                 browse_to = Some(url.clone());
             }
@@ -1049,7 +1180,10 @@ pub fn conflict_modal(app: &mut SheetApp, ctx: &egui::Context) {
         ui.set_width(430.0);
         ui.label(RichText::new(lang.tr("This workbook was not saved")).font(theme::ui_bold(15.0)));
         ui.add_space(8.0);
-        let what = format!("Somebody else saved {} while you were editing it. Nothing was written: saving now would overwrite their work.", conflict.entry.name);
+        let what = format!(
+            "Somebody else saved {} while you were editing it. Nothing was written: saving now would overwrite their work.",
+            conflict.entry.name
+        );
         ui.add(egui::Label::new(what).wrap());
         ui.add_space(6.0);
         ui.add(egui::Label::new(lang.tr("Your own changes are still open here. Reloading replaces them with the stored copy.")).wrap());

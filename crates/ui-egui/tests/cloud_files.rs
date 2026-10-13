@@ -56,6 +56,12 @@ impl State {
     }
 
     fn answer(&mut self, job: Job) -> Vec<Event> {
+        // Signing out needs no session, and answers nothing. The window
+        // clears its own state before the job is ever sent.
+        if matches!(job, Job::SignOut) {
+            self.linked = false;
+            return Vec::new();
+        }
         if !self.linked && !matches!(job, Job::LinkStart | Job::LinkPoll(_)) {
             return vec![match job {
                 Job::Account => Event::Account(Err(Fault::NotLinked)),
@@ -64,9 +70,12 @@ impl State {
                 Job::Read { entry, into, .. } => Event::Read { entry, into, bytes: Err(Fault::NotLinked) },
                 Job::Write { uid, .. } | Job::Create { uid, .. } => Event::Saved { uid, entry: Err(Fault::NotLinked) },
                 Job::LinkStart | Job::LinkPoll(_) => Event::Linked(Ok(false)),
+                // Handled above, before this arm is reached.
+                Job::SignOut => return Vec::new(),
             }];
         }
         match job {
+            Job::SignOut => Vec::new(),
             Job::Account => vec![Event::Account(self.account())],
             Job::LinkStart => {
                 vec![Event::Browser { url: "https://cloud.example/link/abc".to_owned(), handle: Some("abc".to_owned()) }]
@@ -198,9 +207,11 @@ fn harness(state: State) -> (Harness, Fake) {
 
 /// A linked account with two folders of files and one incoming share.
 fn furnished() -> State {
-    let mut state = State::default();
-    state.linked = true;
-    state.capabilities = vec![Capability::Files, Capability::SharedWithMe, Capability::Sharing, Capability::Etags];
+    let mut state = State {
+        linked: true,
+        capabilities: vec![Capability::Files, Capability::SharedWithMe, Capability::Sharing, Capability::Etags],
+        ..State::default()
+    };
     state.files.push((folder_entry("/Reports"), Vec::new()));
     state.files.push((file_entry("/Budget.xlsx", Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")), workbook_bytes("42")));
     state.files.push((file_entry("/notes.pdf", Some("application/pdf")), b"%PDF-1.4".to_vec()));
@@ -374,11 +385,8 @@ fn no_account_yet_is_an_offer_to_link_and_never_an_error() {
     assert_eq!(status(&mut h)["link"]["waiting"], "https://cloud.example/link/abc");
     // They finish in the browser, and the next poll finds the account there.
     fake.state.lock().unwrap().linked = true;
-    h.state_mut().cloud.link = Some(cloud::Link::Waiting {
-        url: "https://cloud.example/link/abc".to_owned(),
-        handle: Some("abc".to_owned()),
-        next_poll: 0.0,
-    });
+    h.state_mut().cloud.link =
+        Some(cloud::Link::Waiting { url: "https://cloud.example/link/abc".to_owned(), handle: Some("abc".to_owned()), next_poll: 0.0 });
     h.run_steps(6);
     assert_eq!(status(&mut h)["link"], Json::Null);
     assert_eq!(status(&mut h)["account"]["display"], "Ada Lovelace");

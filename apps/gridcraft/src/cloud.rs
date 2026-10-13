@@ -103,6 +103,14 @@ impl Worker {
                 Ok(start) => self.post(Event::Browser { url: start.login_url, handle: Some(start.handle) }),
                 Err(fault) => self.post(Event::Linked(Err(fault))),
             },
+            Job::SignOut => {
+                // The token on disk goes with the session. Leaving it
+                // would sign the user back in on the next run.
+                if let Some(path) = token_path() {
+                    let _ = std::fs::remove_file(path);
+                }
+                self.client = Client::new(&self.base);
+            }
             Job::LinkPoll(handle) => {
                 let answer = self.call(|client| client.link_poll(&handle));
                 self.post(Event::Linked(answer));
@@ -173,7 +181,11 @@ impl Worker {
         }
         self.post(Event::Browser { url: start.verify_url.clone(), handle: None });
         let interval = Duration::from_secs(start.interval.clamp(1, 10));
+        // The desktop binary only: wasm never runs the device flow, and the
+        // clock traps there. The same reason `logging.rs` allows it.
+        #[allow(clippy::disallowed_methods)]
         let deadline = Instant::now() + SIGN_IN_WAIT.min(Duration::from_secs(start.expires_in));
+        #[allow(clippy::disallowed_methods)]
         while Instant::now() < deadline {
             std::thread::sleep(interval);
             match self.client.sign_in_poll(&start.device_code) {
@@ -271,11 +283,19 @@ fn restrict(_path: &Path) {}
 
 fn open_browser(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
-    // The empty argument is the window title, which `start` would otherwise
-    // take the URL to be.
+    // `cmd` splits its command line on `&` before anything else sees it, and an
+    // authorize URL is mostly `&`. Passed unquoted the browser receives the
+    // query up to the first one, and the identity provider then reports that
+    // the client identifier is missing, which by then it is.
+    //
+    // The quotes have to survive Rust's own argument escaping, so the command
+    // line goes through raw. The empty pair is the window title, which `start`
+    // would otherwise take the URL to be. A quote inside the URL would end the
+    // quoting early, so it is percent-encoded first.
     let mut command = {
+        use std::os::windows::process::CommandExt as _;
         let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", "", url]);
+        c.raw_arg(format!("/C start \"\" \"{}\"", url.replace('"', "%22")));
         c
     };
     #[cfg(target_os = "macos")]
@@ -318,9 +338,7 @@ impl CloudToken {
         // "Open in …" deep link carries as `file`, and it holds the provider's
         // own handle for the document, which is opaque here. The others are
         // accepted so an older launcher keeps working.
-        let id = var("COLLABCRAFT_FILE")
-            .or_else(|| var("CRAFT_FILE_ID"))
-            .or_else(|| var("CRAFT_DOCUMENT_ID"))?;
+        let id = var("COLLABCRAFT_FILE").or_else(|| var("CRAFT_FILE_ID")).or_else(|| var("CRAFT_DOCUMENT_ID"))?;
         Some(CloudToken { base, id })
     }
 }

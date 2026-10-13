@@ -232,6 +232,9 @@ pub struct SheetApp {
     /// so every Craft app offers the same one. Inert until the host connects a
     /// backend, and unavailable until that service says sharing exists.
     pub share: craft_ui::share::ShareDialog,
+    /// Who is signed in. Also the only way in, since every cloud control
+    /// is gated on an account being linked.
+    pub account: craft_ui::account::AccountMenu,
     pub message: Option<(String, String)>,
     pub toast: Option<(String, f64)>,
     /// Dismissible info bar under the ribbon (open-time notices).
@@ -291,6 +294,7 @@ impl SheetApp {
             backstage: None,
             cloud: cloud::Cloud::default(),
             share: craft_ui::share::ShareDialog::new(),
+            account: craft_ui::account::AccountMenu::new(),
             message: None,
             toast: None,
             notice: None,
