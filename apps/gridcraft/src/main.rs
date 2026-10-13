@@ -378,7 +378,7 @@ fn main() -> eframe::Result<()> {
                 // inbox. Without a service the application is local-only and
                 // offers nothing cloud-shaped.
                 app.services.cloud = cloud::service(cc.egui_ctx.clone());
-                app.share.connect(craft_ui::share::CollabCraft::from_fn(cloud::client));
+                app.share.connect(collabcraft_share::CollabCraft::from_fn(cloud::client));
                 if let Some(port) = control_port {
                     match control_server::start(port, cc.egui_ctx.clone()) {
                         Ok(rx) => app.control_rx = Some(rx),
