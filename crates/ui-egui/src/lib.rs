@@ -1226,6 +1226,9 @@ impl SheetApp {
         // answers are collected, which has to keep happening while the dialog
         // is shut.
         self.share.show(&ctx);
+        // A share of a document that has never been saved. The dialog asked;
+        // only this side can serialise a workbook, so it answers.
+        share_save(self);
         // Above the message box: a refused save has to be answered, and the
         // answer decides what happens to the user's edits.
         cloud::conflict_modal(self, &ctx);
@@ -1358,4 +1361,35 @@ pub fn now_ms() -> f64 {
 
 pub fn cell(r: u32, c: u32) -> CellRef {
     CellRef::new(r, c)
+}
+
+/// Carry out a save the share dialog asked for, and report the outcome back.
+///
+/// Split into asking and answering because the save is asynchronous. The
+/// dialog waits, showing its own progress, until one of these arrives.
+fn share_save(app: &mut SheetApp) {
+    if let Some(request) = app.share.take_save_request() {
+        // One destination today. `request.destination` names which, and is
+        // carried through so a second provider needs no change here.
+        let _ = request.destination;
+        match cloud::save_as(app, "/", &request.name) {
+            Ok(_) => app.cloud.sharing_save = true,
+            Err(reason) => app.share.save_failed(reason),
+        }
+    }
+
+    // The worker reports by clearing `busy`. A new origin means it landed.
+    if app.cloud.sharing_save && app.cloud.busy.is_none() {
+        app.cloud.sharing_save = false;
+        match cloud::origin(app) {
+            Some(origin) => {
+                let (id, name) = (origin.entry.id.clone(), origin.entry.name.clone());
+                app.share.saved(id, name);
+            }
+            None => {
+                let reason = app.cloud.status.clone().unwrap_or_else(|| "the workbook was not saved".to_owned());
+                app.share.save_failed(reason);
+            }
+        }
+    }
 }

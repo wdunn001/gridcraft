@@ -268,6 +268,9 @@ pub struct Cloud {
     sent: HashMap<u64, Arc<Workbook>>,
     /// The last thing that happened, for the line under the page title.
     pub status: Option<String>,
+    /// Whether the transfer in flight was started by the share dialog, which
+    /// is waiting to be told how it went.
+    pub sharing_save: bool,
 }
 
 // ---------------------------------------------------------------- asking
