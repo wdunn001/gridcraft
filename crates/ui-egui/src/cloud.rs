@@ -25,12 +25,13 @@ use std::sync::Arc;
 // depending on the crates they come from.
 pub use craft_cloud::{Capability, Entry, EntryKind};
 pub use craft_ui::cloud::{
-    Account, Busy, CloudApp, CloudBackend, CloudFiles, Conflict, CopyFormat, DocumentKind, Event, Fault, Folder, Job, Link, Origin, Post, Source,
-    UNAVAILABLE, available, browse, can_converse, conflict_modal, destination_name, has_target, link, load_shared, open_entry, open_page, origin,
-    parent_of, prefers_cloud, progress, pump, reload_active, save, save_as, save_page, share_button, shares, sign_in, sign_out, start, who,
-    work_together,
+    Account, Busy, CloudApp, CloudBackend, CloudFiles, Conflict, CopyFormat, Destination, DocumentKind, Event, Fault, Folder, Job, Link, Origin,
+    Post, Source, UNAVAILABLE, available, browse, can_converse, conflict_modal, destination_name, has_target, link, load_shared, open_entry,
+    open_page, origin, parent_of, prefers_cloud, progress, pump, reload_active, save, save_as, save_page, share_button, shares, sign_in, sign_out,
+    start, who, work_together,
 };
 use egui::{Color32, Painter, Rect, Ui};
+use gridcraft_engine::io::FileKind;
 use gridcraft_engine::model::Workbook;
 use serde_json::{Value as Json, json};
 
@@ -107,6 +108,33 @@ fn service_host() -> String {
         .unwrap_or_default()
 }
 
+/// The format a save should be written in, when the name cannot say.
+///
+/// A provider that issued no extension still says what the thing is. A file
+/// exported by a web application commonly has a correct content type and a
+/// bare name, and `exported` from such a service is a real CSV. Writing a
+/// workbook over it would replace a readable file with one nothing opens.
+///
+/// `None` leaves the name to decide, which is the ordinary case and the one
+/// that refuses an extension this application cannot write.
+fn kind_of(into: Destination<'_>) -> Option<FileKind> {
+    if !into.extension().is_empty() {
+        return None;
+    }
+    let mime = into.mime?;
+    let mime = mime.split(';').next().unwrap_or(mime).trim();
+    match mime {
+        "text/csv" => Some(FileKind::Csv),
+        "text/tab-separated-values" => Some(FileKind::Tsv),
+        "application/json" => Some(FileKind::Json),
+        "text/html" => Some(FileKind::Html),
+        // Everything else this application opens is a package format whose
+        // writer wants a real name. Letting `save_bytes` refuse says which
+        // formats are available, which is more use than a guess.
+        _ => None,
+    }
+}
+
 impl CloudApp for SheetApp {
     fn cloud(&self) -> &CloudFiles {
         &self.cloud
@@ -147,10 +175,18 @@ impl CloudApp for SheetApp {
         }
     }
 
-    fn encode(&mut self, uid: u64) -> Result<Vec<u8>, String> {
+    fn encode(&mut self, uid: u64, into: Destination<'_>) -> Result<Vec<u8>, String> {
         let doc = self.session.documents().iter().find(|d| d.uid == uid).ok_or("no workbook open")?;
         let snapshot = doc.wb.clone();
-        let bytes = gridcraft_engine::io::save_bytes(&snapshot, "workbook.xlsx").map_err(|e| e.to_string())?;
+        // The destination decides the format. A workbook opened from the cloud
+        // as a CSV goes back as a CSV. Writing XLSX under that name would hand
+        // somebody a file their spreadsheet refuses to open, with nothing
+        // saying why. `save_bytes` refuses an extension it cannot write and
+        // names the ones it can, which is an answer a person can act on.
+        let bytes = match kind_of(into) {
+            Some(kind) => gridcraft_engine::io::save_bytes_as(&snapshot, into.name, kind).map_err(|e| e.to_string())?,
+            None => gridcraft_engine::io::save_bytes(&snapshot, into.name).map_err(|e| e.to_string())?,
+        };
         self.cloud_sent.insert(uid, snapshot);
         Ok(bytes)
     }

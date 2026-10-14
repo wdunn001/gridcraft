@@ -653,3 +653,23 @@ fn renders_for_review() {
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Share").click();
     save(&mut h, "share-dialog");
 }
+
+#[test]
+fn a_workbook_goes_back_in_the_format_its_name_asks_for() {
+    // `exported` in the fixture is a CSV the provider reported as text/csv.
+    // Saving it as XLSX under that name would hand somebody a file their
+    // spreadsheet refuses to open, and nothing would say why.
+    let (mut h, fake) = harness(furnished());
+    h.state_mut().run("cloud.open", json!({})).unwrap();
+    h.run_steps(4);
+    h.state_mut().run("cloud.openFile", json!({"name": "exported"})).unwrap();
+    h.run_steps(4);
+    h.state_mut().run("cell.set", json!({"cell": "A1", "input": "9"})).unwrap();
+    h.run_steps(2);
+    h.state_mut().run("cloud.save", json!({})).unwrap();
+    h.run_steps(6);
+
+    let saved = fake.state.lock().unwrap().files.iter().find(|(e, _)| e.name == "exported").map(|(_, b)| b.clone()).expect("the file is there");
+    assert!(saved.starts_with(b"9"), "a CSV starts with its first cell, not a zip header: {:?}", &saved[..saved.len().min(8)]);
+    assert!(!saved.starts_with(b"PK"), "XLSX bytes under a CSV name is the defect this test exists for");
+}
