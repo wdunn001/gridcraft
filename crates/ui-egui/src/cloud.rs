@@ -62,10 +62,14 @@ pub enum Job {
     Create { uid: u64, folder: String, name: String, bytes: Vec<u8> },
     /// End the session and forget the saved token.
     SignOut,
+    /// Where to go to work together on a document.
+    Conversation(String),
 }
 
 /// What a worker reports back.
 pub enum Event {
+    /// Where to go to work together, or why there is nowhere.
+    Conversation(Result<craft_cloud::Conversation, Fault>),
     Account(Result<Account, Fault>),
     /// A link or a sign-in needs the user's browser. `handle` is polled until
     /// they are done, when the service gave one.
@@ -412,6 +416,33 @@ pub fn sign_in(app: &mut SheetApp) {
 ///
 /// The saved token goes too. Forgetting the account on screen while leaving
 /// the token on disk would sign the user back in on the next run.
+/// Asks where to work together on the open document, then opens it.
+///
+/// Only offered where the provider reports it. A document that has never
+/// been in the cloud has no handle to key a room on, so there is nothing
+/// to ask about either.
+pub fn work_together(app: &mut SheetApp) {
+    if !available(app) {
+        return;
+    }
+    let Some(origin) = origin(app) else {
+        app.cloud.status = Some("Save this workbook to the cloud first".to_owned());
+        return;
+    };
+    converse(app, origin.entry.id.clone());
+}
+
+/// Asks the provider where to work together on one document.
+fn converse(app: &mut SheetApp, id: String) {
+    app.cloud.status = Some("Opening a conversation".to_owned());
+    submit(app, Job::Conversation(id));
+}
+
+/// Whether the provider offers somewhere to talk about a document.
+pub fn can_converse(app: &SheetApp) -> bool {
+    app.cloud.account.as_ref().is_some_and(|a| a.capabilities.contains(&Capability::Conversation))
+}
+
 pub fn sign_out(app: &mut SheetApp) {
     app.cloud.account = None;
     app.cloud.account_fault = None;
@@ -637,6 +668,15 @@ fn apply(app: &mut SheetApp, event: Event) {
                 app.cloud.link = Some(Link::Offered);
             }
         }
+        Event::Conversation(Ok(conversation)) => {
+            app.cloud.status = Some(format!("Opened in {}", conversation.name));
+            if let Some(open) = &app.services.open_url {
+                open(&conversation.url);
+            }
+        }
+        Event::Conversation(Err(fault)) => {
+            app.cloud.status = Some(fault.text());
+        }
         Event::Account(Err(fault)) => app.cloud.account_fault = Some(fault),
         Event::Browser { url, handle } => {
             if let Some(open) = &app.services.open_url {
@@ -815,9 +855,9 @@ fn size_text(bytes: Option<u64>) -> String {
 /// One row in a file list, with a second line for the detail that matters on
 /// that side of the page (a size for your own files, who shared it for
 /// somebody else's).
-fn entry_row(ui: &mut Ui, entry: &Entry, detail: &str) -> egui::Response {
+fn entry_row(ui: &mut Ui, entry: &Entry, detail: &str, reserve: f32) -> egui::Response {
     let t = Tokens::get(ui.ctx());
-    let width = ui.available_width();
+    let width = (ui.available_width() - reserve).max(60.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 40.0), Sense::click());
     let label = entry.name.clone();
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
@@ -833,6 +873,34 @@ fn entry_row(ui: &mut Ui, entry: &Entry, detail: &str) -> egui::Response {
         p.text(pos2(rect.left() + 38.0, detail_y), Align2::LEFT_CENTER, detail, theme::ui_font(11.0), t.text_dim);
     }
     resp
+}
+
+/// The character a label ends with when choosing it opens a dialog.
+const ELLIPSIS: &str = "\u{2026}";
+
+/// The `…` beside a document, and what a person chose from it.
+///
+/// Only the actions the provider actually offers appear. A greyed-out item says
+/// the action exists and is not possible right now. An absent one says this
+/// provider does not do that at all, and those are different facts.
+fn row_actions(app: &SheetApp, ui: &mut Ui, entry: &Entry) -> Option<String> {
+    let lang = app.ui.language;
+    let can = |c: Capability| app.cloud.account.as_ref().is_some_and(|a| a.can(c));
+    let mut items = vec![craft_ui::menu::MenuItem::new("open", lang.tr("Open"))];
+    if can(Capability::Sharing) {
+        items.push(
+            craft_ui::menu::MenuItem::new("share", format!("{}{}", lang.tr("Share"), ELLIPSIS))
+                .detail(lang.tr("See who this is shared with, and invite somebody"))
+                .separated(),
+        );
+    }
+    if can(Capability::Conversation) {
+        items.push(craft_ui::menu::MenuItem::new("talk", lang.tr("Work together")).detail(lang.tr("Open a conversation about this document")));
+    }
+    let labels = craft_ui::menu::MenuLabels { more: lang.tr("More options").to_owned(), ..Default::default() };
+    // Salted by the handle. Two rows drawing the same control need two menus,
+    // and the handle is the one thing that differs between them.
+    ui.push_id(entry.id.clone(), |ui| craft_ui::menu::overflow(ui, &items, &labels)).inner
 }
 
 /// A bordered column with a heading. This is how the two Open sources sit side
@@ -955,6 +1023,13 @@ pub fn progress(app: &SheetApp, ui: &mut Ui) {
 
 /// File › Open, the cloud part. Your own files sit on one side and what other
 /// people shared with you sits on the other.
+/// What an overflow menu asked for, deferred until the list is no longer
+/// being drawn. Opening a dialog while borrowing the list is not possible.
+enum Act {
+    Share(Entry),
+    Talk(Entry),
+}
+
 pub fn open_page(app: &mut SheetApp, ui: &mut Ui) {
     start(app);
     header(app, ui);
@@ -971,17 +1046,25 @@ pub fn open_page(app: &mut SheetApp, ui: &mut Ui) {
     }
     let mut pick: Option<(Entry, Source)> = None;
     let mut go: Option<String> = None;
+    let mut act: Option<Act> = None;
     if shared_offered {
         ui.columns(2, |columns| {
             if let Some(ui) = columns.get_mut(0) {
-                my_files(app, ui, &mut pick, &mut go);
+                my_files(app, ui, &mut pick, &mut go, &mut act);
             }
             if let Some(ui) = columns.get_mut(1) {
-                shared_files(app, ui, &mut pick);
+                shared_files(app, ui, &mut pick, &mut act);
             }
         });
     } else {
-        my_files(app, ui, &mut pick, &mut go);
+        my_files(app, ui, &mut pick, &mut go, &mut act);
+    }
+    match act {
+        // Sharing a document in the list, which is not the one that happens to
+        // be open. The dialog is told which.
+        Some(Act::Share(entry)) => app.share.open(entry.id.clone(), entry.name.clone()),
+        Some(Act::Talk(entry)) => converse(app, entry.id.clone()),
+        None => {}
     }
     if let Some(path) = go {
         browse(app, &path);
@@ -997,7 +1080,7 @@ pub fn open_page(app: &mut SheetApp, ui: &mut Ui) {
 
 /// Your own files: where you are, a way up, then the folders and the documents
 /// GridCraft can open.
-fn my_files(app: &mut SheetApp, ui: &mut Ui, pick: &mut Option<(Entry, Source)>, go: &mut Option<String>) {
+fn my_files(app: &mut SheetApp, ui: &mut Ui, pick: &mut Option<(Entry, Source)>, go: &mut Option<String>, act: &mut Option<Act>) {
     let lang = app.ui.language;
     let folder = app.cloud.mine.clone();
     column(ui, lang.tr("My files"), |ui| {
@@ -1030,12 +1113,28 @@ fn my_files(app: &mut SheetApp, ui: &mut Ui, pick: &mut Option<(Entry, Source)>,
             }
             shown += 1;
             let detail = if is_folder { String::new() } else { size_text(entry.size) };
-            if entry_row(ui, entry, &detail).clicked() {
-                if is_folder {
-                    *go = Some(entry.path.clone());
-                } else {
-                    *pick = Some((entry.clone(), Source::Mine));
+            // A folder has nothing behind an ellipsis. Opening it is the only
+            // thing to do with one here.
+            let reserve = if is_folder { 0.0 } else { 26.0 };
+            let (row, chose) = ui
+                .horizontal(|ui| {
+                    let row = entry_row(ui, entry, &detail, reserve).clicked();
+                    let chose = if is_folder { None } else { row_actions(app, ui, entry) };
+                    (row, chose)
+                })
+                .inner;
+            match chose.as_deref() {
+                Some("share") => *act = Some(Act::Share(entry.clone())),
+                Some("talk") => *act = Some(Act::Talk(entry.clone())),
+                Some("open") => *pick = Some((entry.clone(), Source::Mine)),
+                _ if row => {
+                    if is_folder {
+                        *go = Some(entry.path.clone());
+                    } else {
+                        *pick = Some((entry.clone(), Source::Mine));
+                    }
                 }
+                _ => {}
             }
         }
         if shown == 0 && folder.loaded {
@@ -1046,7 +1145,7 @@ fn my_files(app: &mut SheetApp, ui: &mut Ui, pick: &mut Option<(Entry, Source)>,
 
 /// What other people shared with you. One flat list, because an incoming share
 /// has no folder of yours to sit in. Each row says who shared it.
-fn shared_files(app: &mut SheetApp, ui: &mut Ui, pick: &mut Option<(Entry, Source)>) {
+fn shared_files(app: &mut SheetApp, ui: &mut Ui, pick: &mut Option<(Entry, Source)>, act: &mut Option<Act>) {
     let lang = app.ui.language;
     let shared = app.cloud.shared.clone();
     column(ui, lang.tr("Shared with me"), |ui| {
@@ -1066,8 +1165,17 @@ fn shared_files(app: &mut SheetApp, ui: &mut Ui, pick: &mut Option<(Entry, Sourc
             shown += 1;
             let who = entry.shared_by.clone().unwrap_or_else(|| lang.tr("Shared with you").to_owned());
             let detail = if entry.writable { who } else { format!("{who} ({})", lang.tr("read-only")) };
-            if entry_row(ui, entry, &detail).clicked() {
-                *pick = Some((entry.clone(), Source::Shared));
+            let (row, chose) = ui
+                .horizontal(|ui| {
+                    let row = entry_row(ui, entry, &detail, 26.0).clicked();
+                    (row, row_actions(app, ui, entry))
+                })
+                .inner;
+            match chose.as_deref() {
+                Some("share") => *act = Some(Act::Share(entry.clone())),
+                Some("talk") => *act = Some(Act::Talk(entry.clone())),
+                _ if row || chose.is_some() => *pick = Some((entry.clone(), Source::Shared)),
+                _ => {}
             }
         }
         if shown == 0 && shared.loaded {
@@ -1123,7 +1231,7 @@ pub fn save_page(app: &mut SheetApp, ui: &mut Ui) -> bool {
         let mut folders = 0;
         for entry in folder.entries.iter().filter(|e| e.kind == EntryKind::Folder) {
             folders += 1;
-            if entry_row(ui, entry, "").clicked() {
+            if entry_row(ui, entry, "", 0.0).clicked() {
                 go = Some(entry.path.clone());
             }
         }

@@ -70,12 +70,21 @@ impl State {
                 Job::Read { entry, into, .. } => Event::Read { entry, into, bytes: Err(Fault::NotLinked) },
                 Job::Write { uid, .. } | Job::Create { uid, .. } => Event::Saved { uid, entry: Err(Fault::NotLinked) },
                 Job::LinkStart | Job::LinkPoll(_) => Event::Linked(Ok(false)),
+                Job::Conversation(_) => Event::Conversation(Err(Fault::NotLinked)),
                 // Handled above, before this arm is reached.
                 Job::SignOut => return Vec::new(),
             }];
         }
         match job {
             Job::SignOut => Vec::new(),
+            Job::Conversation(_) => {
+                if !self.capabilities.contains(&Capability::Conversation) {
+                    let why = "this provider has nowhere to talk".to_owned();
+                    return vec![Event::Conversation(Err(Fault::Refused(why)))];
+                }
+                let room = craft_cloud::Conversation { url: "https://cloud.example/call/room".to_owned(), name: "Talk".to_owned() };
+                vec![Event::Conversation(Ok(room))]
+            }
             Job::Account => vec![Event::Account(self.account())],
             Job::LinkStart => {
                 vec![Event::Browser { url: "https://cloud.example/link/abc".to_owned(), handle: Some("abc".to_owned()) }]
@@ -174,7 +183,82 @@ struct Fake {
     opened_urls: Arc<Mutex<Vec<String>>>,
 }
 
+/// A sharing service that answers out of a fixed set of people.
+///
+/// The share dialog is a craft-ui control with its own tests. This exists so
+/// the window has somewhere to share to. That is what decides whether the
+/// title bar draws a split button at all.
+struct Sharing;
+
+impl craft_ui::share::ShareBackend for Sharing {
+    fn submit(&self, request: craft_ui::share::Request, reply: craft_ui::share::Replier) {
+        use craft_cloud::{Contact, Permission, Share, ShareTarget};
+        use craft_ui::share::{Answer, Request};
+        let person = |id: &str, name: &str, email: &str| Contact {
+            id: id.to_owned(),
+            target: ShareTarget::User(id.to_owned()),
+            name: name.to_owned(),
+            email: Some(email.to_owned()),
+            avatar: None,
+            is_group: false,
+        };
+        match request {
+            Request::Capabilities => reply.answer(Answer::Capabilities {
+                capabilities: vec![
+                    Capability::Sharing,
+                    Capability::Contacts,
+                    Capability::LinkShares,
+                    Capability::LinkPassword,
+                    Capability::ShareNotify,
+                ],
+                linked: true,
+            }),
+            Request::Lookup { query, .. } => {
+                let everybody = [
+                    person("dana", "Dana Okafor", "dana@example.org"),
+                    person("priya", "Priya Raman", "priya@example.org"),
+                    person("tomas", "Tom\u{e1}s Alvarez", "tomas@example.org"),
+                ];
+                let want = query.to_lowercase();
+                reply.answer(Answer::Lookup(everybody.into_iter().filter(|c| c.name.to_lowercase().contains(&want)).collect()));
+            }
+            Request::Access { .. } => reply.answer(Answer::Access(vec![
+                Share {
+                    id: "s1".to_owned(),
+                    target: ShareTarget::User("dana".to_owned()),
+                    display: Some("Dana Okafor".to_owned()),
+                    permission: Permission::Edit,
+                    url: None,
+                    note: None,
+                    created: None,
+                },
+                Share {
+                    id: "s2".to_owned(),
+                    target: ShareTarget::Link,
+                    display: None,
+                    permission: Permission::View,
+                    url: Some("https://cloud.example/s/abc123".to_owned()),
+                    note: None,
+                    created: None,
+                },
+            ])),
+            other => reply.refuse(format!("{other:?} is not offered here")),
+        }
+    }
+}
+
 fn harness(state: State) -> (Harness, Fake) {
+    build(state, false)
+}
+
+/// The same window, with an offscreen renderer attached so a frame can be
+/// written to a file. Only the render test asks for one. Starting wgpu for
+/// every behaviour test would cost seconds and prove nothing.
+fn rendering(state: State) -> (Harness, Fake) {
+    build(state, true)
+}
+
+fn build(state: State, rendering: bool) -> (Harness, Fake) {
     let store = Arc::new(Mutex::new(state));
     let inbox: cloud::Inbox = Arc::new(Mutex::new(Vec::new()));
     let urls = Arc::new(Mutex::new(Vec::new()));
@@ -193,13 +277,26 @@ fn harness(state: State) -> (Harness, Fake) {
     };
     let mut session = Session::new();
     session.new_workbook();
-    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 900.0)).build_ui_state(
+    let builder = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 900.0));
+    // Two device pixels per point, so a render is legible when somebody looks
+    // at it. The behaviour tests keep one, where a click lands on the point it
+    // was aimed at.
+    let builder = if rendering { builder.with_pixels_per_point(2.0).wgpu() } else { builder };
+    let mut h = builder.build_ui_state(
         |ui, app: &mut SheetApp| {
             let ctx = ui.ctx().clone();
             app.logic(&ctx);
             app.ui(ui);
         },
-        SheetApp::new(session, services),
+        {
+            let mut app = SheetApp::new(session, services);
+            // Only a render wants one. A behaviour test that asked for
+            // capabilities it never uses would answer a question nobody put.
+            if rendering {
+                app.share.connect(Sharing);
+            }
+            app
+        },
     );
     h.run_steps(4);
     (h, Fake { state: store, opened_urls: urls })
@@ -457,4 +554,101 @@ fn names_and_paths_are_handled_as_a_user_types_them() {
     assert_eq!(cloud::parent_of(""), None);
     assert_eq!(cloud::parent_of("/Reports"), Some(String::new()));
     assert_eq!(cloud::parent_of("/Reports/2026"), Some("/Reports".to_owned()));
+}
+
+#[test]
+fn working_together_opens_where_the_provider_says_to_go() {
+    let mut state = furnished();
+    state.capabilities.push(Capability::Conversation);
+    let (mut h, fake) = harness(state);
+    h.state_mut().run("cloud.open", json!({})).unwrap();
+    h.run_steps(4);
+    h.state_mut().run("cloud.openFile", json!({"name": "Budget.xlsx"})).unwrap();
+    h.run_steps(4);
+
+    assert!(cloud::can_converse(h.state()), "the capability was reported");
+    cloud::work_together(h.state_mut());
+    h.run_steps(4);
+
+    let opened = fake.opened_urls.lock().unwrap().clone();
+    assert_eq!(opened, vec!["https://cloud.example/call/room".to_owned()]);
+    assert_eq!(status(&mut h)["status"], json!("Opened in Talk"));
+}
+
+#[test]
+fn a_workbook_that_was_never_in_the_cloud_is_asked_to_be_saved_there_first() {
+    let mut state = furnished();
+    state.capabilities.push(Capability::Conversation);
+    let (mut h, fake) = harness(state);
+
+    // A new workbook, which is what the harness starts with. There is no
+    // handle to key a conversation on.
+    cloud::work_together(h.state_mut());
+    h.run_steps(4);
+
+    assert!(fake.opened_urls.lock().unwrap().is_empty(), "nowhere to go, so nothing opened");
+    assert_eq!(status(&mut h)["status"], json!("Save this workbook to the cloud first"));
+}
+
+#[test]
+fn a_provider_with_nowhere_to_talk_never_offers_it() {
+    // furnished() reports no conversation capability.
+    let (h, _fake) = harness(furnished());
+    assert!(!cloud::can_converse(h.state()), "the control has nothing to draw");
+}
+
+/// Writes one PNG per state to the directory in `GRIDCRAFT_CLOUD_RENDERS`.
+///
+/// Skipped without it. The renders are review material for a human being, and
+/// the behaviour they illustrate is asserted by the tests above. Starting wgpu
+/// in ordinary CI would buy nothing.
+#[test]
+fn renders_for_review() {
+    let Ok(into) = std::env::var("GRIDCRAFT_CLOUD_RENDERS") else {
+        eprintln!("set GRIDCRAFT_CLOUD_RENDERS to a directory to write renders");
+        return;
+    };
+    let into = std::path::PathBuf::from(into);
+    std::fs::create_dir_all(&into).expect("the render directory must be writable");
+
+    let save = |h: &mut Harness, name: &str| {
+        h.run_steps(8);
+        let image = h.render().expect("an offscreen renderer is required to write renders");
+        let path = into.join(format!("gridcraft-{name}.png"));
+        image.save(&path).expect("the render directory must be writable");
+        eprintln!("wrote {}", path.display());
+    };
+
+    // The file list, where every document carries an overflow menu.
+    // One provider that does everything, built twice. Two windows are needed
+    // because one of them has a workbook open and the other is browsing.
+    let talkative = || {
+        let mut state = furnished();
+        state.capabilities.push(Capability::Conversation);
+        state
+    };
+    let (mut h, _fake) = rendering(talkative());
+    open_page(&mut h);
+    save(&mut h, "open-page");
+
+    // The same page with one of those menus open.
+    h.get_all_by_role_and_label(egui::accesskit::Role::Button, "More options").next().expect("a row offers its menu").click();
+    save(&mut h, "open-page-overflow");
+
+    // The title bar: the account, who else is here, and Share as a split
+    // button with the chevron pressed.
+    let (mut h, _fake) = rendering(talkative());
+    h.state_mut().run("cloud.open", json!({})).unwrap();
+    h.run_steps(4);
+    h.state_mut().run("cloud.openFile", json!({"name": "Budget.xlsx"})).unwrap();
+    h.run_steps(4);
+    let peers = ["Dana Okafor", "Priya Raman", "Tomás Alvarez", "Wen Li", "Sam Iredale", "Rosa Beltrán"];
+    h.state_mut().presence.set(peers.iter().enumerate().map(|(n, who)| craft_ui::presence::Peer::new(format!("peer-{n}"), *who)).collect());
+    save(&mut h, "title-bar-presence");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "More share options").click();
+    save(&mut h, "share-split-menu");
+
+    // And the dialog the primary half opens, with real access on it.
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Share").click();
+    save(&mut h, "share-dialog");
 }

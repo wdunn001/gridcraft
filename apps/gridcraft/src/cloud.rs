@@ -92,10 +92,12 @@ impl Worker {
     fn run(&mut self, job: Job) {
         match job {
             Job::Account => {
-                let answer = self.call(|client| client.me()).map(|me| Account {
-                    display: me.display,
-                    capabilities: me.capabilities,
-                    provider_linked: me.provider_linked,
+                let answer = self.call(|client| client.me()).map(|me| {
+                    // The one moment this application learns who it is signed
+                    // in as. The session file is written before the answer
+                    // exists, so it is completed here.
+                    remember_account(&me.id, &me.display);
+                    Account { display: me.display, capabilities: me.capabilities, provider_linked: me.provider_linked }
                 });
                 self.post(Event::Account(answer));
             }
@@ -103,6 +105,10 @@ impl Worker {
                 Ok(start) => self.post(Event::Browser { url: start.login_url, handle: Some(start.handle) }),
                 Err(fault) => self.post(Event::Linked(Err(fault))),
             },
+            Job::Conversation(id) => {
+                let answer = self.call(|client| client.conversation(&id));
+                self.post(Event::Conversation(answer));
+            }
             Job::SignOut => {
                 // The token on disk goes with the session. Leaving it
                 // would sign the user back in on the next run.
@@ -219,6 +225,12 @@ fn fault(e: Error) -> Fault {
         Error::Refused { code, .. } if code == "conflict" || code == "409" || code == "412" => Fault::Conflict,
         Error::Refused { code, detail } => Fault::Refused(if detail.trim().is_empty() { code } else { detail }),
         Error::Malformed(detail) => Fault::Refused(format!("the cloud service gave an answer GridCraft could not read: {detail}")),
+        // A request this application built wrongly. Nothing the user did,
+        // and nothing they can do, so it is said plainly and logged.
+        Error::Unsendable(detail) => {
+            log::error!("cloud request could not be encoded: {detail}");
+            Fault::Refused("GridCraft could not build that request".to_owned())
+        }
     }
 }
 
@@ -255,8 +267,30 @@ fn load_token() -> Option<String> {
 }
 
 fn save_token(token: &str) {
+    let service = base_url().unwrap_or_default();
+    write_session(serde_json::json!({"token": token, "service": service}));
+}
+
+/// Record which account this session belongs to, keeping the token.
+///
+/// A token alone identifies nothing. The suite launcher keeps one keychain
+/// entry per account and keys it on the service and the subject the provider
+/// issued, so an application that signs in says who signed in. Called once the
+/// service has answered, because until then this application does not know.
+fn remember_account(subject: &str, display: &str) {
+    let Some(token) = load_token() else { return };
+    let service = base_url().unwrap_or_default();
+    write_session(serde_json::json!({
+        "token": token,
+        "service": service,
+        "subject": subject,
+        "display": display,
+    }));
+}
+
+fn write_session(value: serde_json::Value) {
     let Some(path) = token_path() else { return };
-    let Ok(text) = serde_json::to_vec(&serde_json::json!({"token": token})) else { return };
+    let Ok(text) = serde_json::to_vec(&value) else { return };
     if let Err(e) = std::fs::write(&path, text) {
         log::warn!("could not save the cloud session: {e}");
         return;

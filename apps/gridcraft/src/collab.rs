@@ -138,8 +138,10 @@ pub struct Link {
     local: Receiver<(String, Json)>,
     /// Lines for the user, drained by the app each frame.
     pub notices: Vec<String>,
-    /// Who else is in the document, for the status bar.
-    pub roster: Vec<String>,
+    /// Who else is in the document. The identifier comes with the name
+    /// because a badge's colour is derived from it, and a remote cursor
+    /// drawn elsewhere has to arrive at the same colour.
+    pub roster: Vec<(String, String)>,
     /// The last connection state reported, so a change is announced once
     /// rather than on every frame.
     was_connected: bool,
@@ -260,7 +262,10 @@ impl Link {
                 self.notices.push(format!("{holder} is editing {scope}"));
             }
             Effect::Roster { roster } => {
-                self.roster = roster.into_iter().map(|p| p.display).collect();
+                // Everybody is in this list, the reader included. A row
+                // showing who else is here has to drop itself.
+                let me = self.wire.me().cloned();
+                self.roster = roster.into_iter().filter(|p| Some(&p.peer) != me.as_ref()).map(|p| (p.peer.to_string(), p.display)).collect();
             }
             Effect::Notice { detail } => {
                 log::info!("collab: {detail}");

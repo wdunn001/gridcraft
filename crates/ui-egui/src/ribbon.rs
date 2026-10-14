@@ -128,6 +128,13 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
                 // suite puts it. Drawn first because this layout runs
                 // right to left.
                 crate::cloud::account_badge(ui, app);
+                // Who else is here, beside the account. Nothing is drawn
+                // while a person is working alone, which keeps a solitary
+                // document looking like one.
+                if app.presence.shared() {
+                    ui.add_space(6.0);
+                    app.presence.show(ui);
+                }
                 let __k = icon_button(ui, Icon::Search, t.text_dim, "Search commands (⌘⇧Space)", vec2(28.0, ch));
                 control_keytip(app, ui, &__k, "commandSearch");
                 if __k.clicked() {
@@ -139,15 +146,37 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
                 // falls back to the export menu the button used to be, rather
                 // than offering a share that would fail.
                 if app.share.available() {
-                    if small_button(ui, Icon::Share, "Share", "Share this workbook with other people", false).clicked() {
-                        // The handle the provider issued, which is what a share
-                        // is about. A workbook that has never been in the cloud
-                        // has none, and the dialog says so.
-                        let (id, title) = match crate::cloud::origin(app) {
-                            Some(origin) => (origin.entry.id.clone(), origin.entry.name.clone()),
-                            None => (String::new(), app.session.active().map(|d| d.display_title()).unwrap_or_default()),
-                        };
-                        app.share.open(id, title);
+                    // A split button. Pressing the label shares, which is what
+                    // somebody wants most of the time. The chevron carries the
+                    // variations, and working together is one of them.
+                    let mut items = Vec::new();
+                    if crate::cloud::can_converse(app) {
+                        items.push(craft_ui::menu::MenuItem::new("talk", "Work together").detail("Open a conversation about this workbook"));
+                    }
+                    let copies =
+                        [("xlsx", "Save a Copy as Excel Workbook (.xlsx)…"), ("csv", "Export as CSV…"), ("html", "Export as Web Page (.html)…")];
+                    for (at, (id, label)) in copies.iter().enumerate() {
+                        let item = craft_ui::menu::MenuItem::new(*id, *label);
+                        // A rule above the first copy, so sharing and exporting
+                        // read as two groups rather than one long list.
+                        items.push(if at == 0 && !items.is_empty() { item.separated() } else { item });
+                    }
+                    let labels = craft_ui::menu::MenuLabels::default();
+                    if let Some(hit) = craft_ui::menu::split(ui, "Share", &items, &labels) {
+                        match hit {
+                            craft_ui::menu::SplitHit::Primary => {
+                                // The handle the provider issued, which is what a
+                                // share is about. A workbook that has never been
+                                // in the cloud has none, and the dialog says so.
+                                let (id, title) = match crate::cloud::origin(app) {
+                                    Some(origin) => (origin.entry.id.clone(), origin.entry.name.clone()),
+                                    None => (String::new(), app.session.active().map(|d| d.display_title()).unwrap_or_default()),
+                                };
+                                app.share.open(id, title);
+                            }
+                            craft_ui::menu::SplitHit::Item(what) if what == "talk" => crate::cloud::work_together(app),
+                            craft_ui::menu::SplitHit::Item(fmt) => app.open_dialog("saveCopy", json!({"format": fmt})),
+                        }
                     }
                 } else {
                     let share = small_button(ui, Icon::Share, "Share", "Share: export or save a copy", true);

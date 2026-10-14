@@ -52,6 +52,10 @@ impl eframe::App for App {
         }
         if let Some(link) = &mut self.collab {
             link.pump(&mut self.sheet.session);
+            // Who else is here, straight from the relay's roster. The whole set
+            // is handed over rather than a change, so somebody who left stops
+            // being shown without waiting for a reconnection.
+            self.sheet.presence.set(link.roster.iter().map(|(id, display)| craft_ui::presence::Peer::new(id.clone(), display.clone())).collect());
             for notice in std::mem::take(&mut link.notices) {
                 self.sheet.toast = Some((notice, gridcraft_ui_egui::now_ms()));
             }

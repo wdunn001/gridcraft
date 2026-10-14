@@ -235,6 +235,8 @@ pub struct SheetApp {
     /// Who is signed in. Also the only way in, since every cloud control
     /// is gated on an account being linked.
     pub account: craft_ui::account::AccountMenu,
+    /// Who else is in this document. Draws nothing when nobody is.
+    pub presence: craft_ui::presence::PresenceBar,
     pub message: Option<(String, String)>,
     pub toast: Option<(String, f64)>,
     /// Dismissible info bar under the ribbon (open-time notices).
@@ -295,6 +297,7 @@ impl SheetApp {
             cloud: cloud::Cloud::default(),
             share: craft_ui::share::ShareDialog::new(),
             account: craft_ui::account::AccountMenu::new(),
+            presence: craft_ui::presence::PresenceBar::new().badges_only(),
             message: None,
             toast: None,
             notice: None,
