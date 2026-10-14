@@ -21,6 +21,9 @@ craft-collab = { git = "https://github.com/wdunn001/collabcraft", rev = "700d9b9
 # How this app reaches CollabCraft. No provider credential, no provider URL
 # and no provider protocol live in here.
 craft-cloud-client = { git = "https://github.com/wdunn001/collabcraft", rev = "700d9b9" }
+# Shared suite sign-in: one keychain entry for every Craft App. Pinned like the CollabCraft
+# client above; the contract is docs/suite-account.md in craft-launcher.
+artcraft-suite-account = { git = "https://github.com/wdunn001/craft-launcher", rev = "fcfba9a9c442b95b0005219d1e43b9c9474525b1", package = "artcraft-suite-account" }
 # The share dialog's backend. The dialog is drawn by gridcraft-ui-egui, which
 # opens no socket; this feature is the half that reaches CollabCraft, and it
 # lives here because the session this application collects lives here too.

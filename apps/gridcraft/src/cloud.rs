@@ -18,9 +18,10 @@
 //! would otherwise sit still until the mouse moved.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
-use std::time::{Duration, Instant};
+use std::sync::{Once, mpsc::Sender};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use artcraft_suite_account::{NewAccount, Secret, Shared, Store, migrate};
 use craft_cloud_client::{Client, Error};
 use gridcraft_ui_egui::cloud::{Account, CloudBackend, Event, Fault, Job, Post};
 
@@ -65,6 +66,7 @@ pub fn service(ctx: egui::Context) -> Option<Service> {
     log::info!("cloud storage through {base}");
     let (jobs, receiver) = std::sync::mpsc::channel::<(Job, Post)>();
     let started = std::thread::Builder::new().name("collabcraft".to_owned()).spawn(move || {
+        prepare_suite_session();
         let token = load_token();
         let mut client = Client::new(&base);
         if let Some(token) = token {
@@ -126,9 +128,7 @@ impl Worker {
             Job::SignOut => {
                 // The token on disk goes with the session. Leaving it
                 // would sign the user back in on the next run.
-                if let Some(path) = token_path() {
-                    let _ = std::fs::remove_file(path);
-                }
+                forget_token();
                 self.client = Client::new(&self.base);
             }
             Job::LinkPoll(handle) => {
@@ -261,6 +261,7 @@ fn fault(e: Error) -> Fault {
 /// matters, which is the service and the saved session, so a sign-in through
 /// either reaches both.
 pub fn client() -> Option<Client> {
+    prepare_suite_session();
     let mut client = Client::new(base_url()?);
     if let Some(token) = load_token() {
         client = client.with_token(token);
@@ -275,6 +276,15 @@ fn token_path() -> Option<PathBuf> {
 }
 
 fn load_token() -> Option<String> {
+    if let Some(service) = base_url() {
+        if let Some(token) = suite_token_for(&service) {
+            return Some(token);
+        }
+    }
+    load_token_file()
+}
+
+fn load_token_file() -> Option<String> {
     let raw = std::fs::read(token_path()?).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
     value.get("token")?.as_str().map(str::to_owned).filter(|t| !t.is_empty())
@@ -283,6 +293,65 @@ fn load_token() -> Option<String> {
 fn save_token(token: &str) {
     let service = base_url().unwrap_or_default();
     write_session(serde_json::json!({"token": token, "service": service}));
+}
+
+static SUITE_PREPARED: Once = Once::new();
+
+/// Once at startup: hand a legacy session file to the suite store when it can take it.
+fn prepare_suite_session() {
+    SUITE_PREPARED.call_once(|| {
+        let Some(path) = token_path() else { return };
+        let store = Store::open();
+        match migrate::adopt(&store, &path, suite_now()) {
+            Ok(migrate::Adopted::Taken(_)) => log::info!("the cloud session now lives in the suite keychain"),
+            Ok(migrate::Adopted::Kept { why }) => log::debug!("keeping the local cloud session file: {why}"),
+            Ok(migrate::Adopted::Nothing) => {}
+            Err(e) => log::warn!("could not adopt the legacy cloud session: {e}"),
+        }
+    });
+}
+
+fn suite_now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+fn suite_token_for(service: &str) -> Option<String> {
+    let want = artcraft_suite_account::accounts::normalise(service);
+    if want.is_empty() {
+        return None;
+    }
+    match Store::open().shared() {
+        Shared::Session { account, token } if account.service == want => Some(token.expose().to_owned()),
+        Shared::Unreadable { account, why } if account.service == want => {
+            log::info!("the suite cloud session could not be read: {why}");
+            None
+        }
+        _ => None,
+    }
+}
+
+fn suite_sign_in(subject: &str, display: &str, token: &str) {
+    let Some(service) = base_url() else { return };
+    let new = NewAccount { service, user: subject.to_owned(), display: display.to_owned(), email: None, linked: false };
+    match Store::open().sign_in(&new, &Secret::new(token), suite_now()) {
+        Ok(_) => {}
+        Err(e) => log::warn!("could not store the cloud session in the suite keychain: {e}"),
+    }
+}
+
+fn clear_suite_session() {
+    let Some(want) = base_url() else { return };
+    let want = artcraft_suite_account::accounts::normalise(&want);
+    let store = Store::open();
+    let id = match store.shared() {
+        Shared::Session { account, .. } | Shared::Unreadable { account, .. } if account.service == want => Some(account.id),
+        _ => None,
+    };
+    if let Some(id) = id {
+        if let Err(e) = store.discard(&id) {
+            log::warn!("could not clear the suite cloud session: {e}");
+        }
+    }
 }
 
 /// Record which account this session belongs to, keeping the token.
@@ -300,6 +369,7 @@ fn remember_account(subject: &str, display: &str) {
         "subject": subject,
         "display": display,
     }));
+    suite_sign_in(subject, display, &token);
 }
 
 fn write_session(value: serde_json::Value) {
@@ -316,6 +386,7 @@ fn forget_token() {
     if let Some(path) = token_path() {
         let _ = std::fs::remove_file(path);
     }
+    clear_suite_session();
 }
 
 #[cfg(unix)]
@@ -399,6 +470,7 @@ impl TokenSource for CloudToken {
     fn join(&self) -> Option<(String, String)> {
         // Runs before the window exists, so blocking here is the same trade
         // the sign-in itself makes. A saved session opens no browser.
+        prepare_suite_session();
         let mut client = Client::new(&self.base);
         match load_token() {
             Some(token) => client = client.with_token(token),
