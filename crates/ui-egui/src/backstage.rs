@@ -690,22 +690,13 @@ fn save_as(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcom
     dim(ui, lang.tr("Save the workbook under another name or in another folder."));
     ui.add_space(14.0);
     // Where to save, when there is more than one answer to that.
-    let to_cloud = match bs.save_to_cloud {
-        Some(choice) => choice,
-        None => cloud::available(app) && cloud::origin(app).is_some(),
-    };
+    let to_cloud = bs.save_to_cloud.unwrap_or_else(|| cloud::prefers_cloud(app));
     if cloud::available(app) {
         section(ui, lang, "Where");
         // Named here, before anything is picked, so the destination reads as
         // the user's own account and not as a generic place.
         cloud::start(app);
-        let account = app
-            .cloud
-            .account
-            .as_ref()
-            .map(|a| a.display.clone())
-            .filter(|display| !display.is_empty())
-            .unwrap_or_else(|| lang.tr("Cloud storage").to_owned());
+        let account = cloud::destination_name(app);
         if place_row(ui, Icon::Save, lang.tr("This PC"), lang.tr("A folder on this computer"), !to_cloud).clicked() {
             bs.save_to_cloud = Some(false);
         }

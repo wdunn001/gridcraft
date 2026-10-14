@@ -11,18 +11,18 @@
 //! do that a library cannot: open a browser, and decide how long to keep
 //! polling.
 //!
-//! Every call in `craft_cloud_client` blocks. The interface therefore never
-//! makes one. It posts a [`Job`] down a channel, this thread runs it, and the
-//! answer goes into the shared inbox. The egui context is woken afterwards,
-//! because a worker answering is not a local event and the window would
-//! otherwise sit still until the mouse moved.
+//! Every call in `craft_cloud_client` blocks. The pages therefore never make
+//! one. They state a [`Job`], this thread runs it, and the answer goes back
+//! through the [`Post`] the job arrived with. The egui context is woken
+//! afterwards, because a worker answering is not a local event and the window
+//! would otherwise sit still until the mouse moved.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use craft_cloud_client::{Client, Error};
-use gridcraft_ui_egui::cloud::{Account, CloudService, Event, Fault, Inbox, Job};
+use gridcraft_ui_egui::cloud::{Account, CloudBackend, Event, Fault, Job, Post};
 
 use crate::collab::TokenSource;
 
@@ -42,21 +42,37 @@ fn base_url() -> Option<String> {
         .find(|value| !value.is_empty())
 }
 
+/// A handle to the worker, as the pages see it.
+///
+/// Every job is answered on that thread. Nothing a page does can block a
+/// frame. One queue serves them all, so a twenty megabyte save holds up the
+/// jobs behind it. That is why the share dialog has a client of its own.
+pub struct Service {
+    jobs: Sender<(Job, Post)>,
+}
+
+impl CloudBackend for Service {
+    fn submit(&self, job: Job, post: Post) {
+        if self.jobs.send((job, post)).is_err() {
+            log::warn!("the cloud worker is gone; the job was dropped");
+        }
+    }
+}
+
 /// Starts the worker, when a service is configured.
-pub fn service(ctx: egui::Context) -> Option<CloudService> {
+pub fn service(ctx: egui::Context) -> Option<Service> {
     let base = base_url()?;
     log::info!("cloud storage through {base}");
-    let inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
-    let (sender, receiver) = std::sync::mpsc::channel::<Job>();
-    let worker_inbox = inbox.clone();
+    let (jobs, receiver) = std::sync::mpsc::channel::<(Job, Post)>();
     let started = std::thread::Builder::new().name("collabcraft".to_owned()).spawn(move || {
         let token = load_token();
         let mut client = Client::new(&base);
         if let Some(token) = token {
             client = client.with_token(token);
         }
-        let mut worker = Worker { client, base, inbox: worker_inbox, ctx };
-        while let Ok(job) = receiver.recv() {
+        let mut worker = Worker { client, base, ctx, answering: None };
+        while let Ok((job, post)) = receiver.recv() {
+            worker.answering = Some(post);
             worker.run(job);
         }
     });
@@ -64,14 +80,7 @@ pub fn service(ctx: egui::Context) -> Option<CloudService> {
         log::error!("the cloud worker did not start: {e}");
         return None;
     }
-    Some(CloudService {
-        submit: Box::new(move |job| {
-            if sender.send(job).is_err() {
-                log::warn!("the cloud worker is gone; the job was dropped");
-            }
-        }),
-        inbox,
-    })
+    Some(Service { jobs })
 }
 
 struct Worker {
@@ -79,13 +88,18 @@ struct Worker {
     /// Kept beside the client so a rejected session can be replaced with a
     /// fresh one pointed at the same service.
     base: String,
-    inbox: Inbox,
     ctx: egui::Context,
+    /// Where the job in hand sends its answers. Read more than once per job,
+    /// because a sign-in reports the URL it wants a browser pointed at before
+    /// the job that triggered it finishes.
+    answering: Option<Post>,
 }
 
 impl Worker {
     fn post(&self, event: Event) {
-        self.inbox.lock().unwrap_or_else(PoisonError::into_inner).push(event);
+        if let Some(post) = &self.answering {
+            post.send(event);
+        }
         self.ctx.request_repaint();
     }
 

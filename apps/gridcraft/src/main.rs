@@ -378,10 +378,12 @@ fn main() -> eframe::Result<()> {
                 SheetApp::setup_context_for_language(&cc.egui_ctx, app.ui.dark, app.ui.language);
                 // Open and Save against cloud storage, when a CollabCraft
                 // service is configured. Every call it makes blocks, so it
-                // runs on a worker and answers reach the window through an
-                // inbox. Without a service the application is local-only and
-                // offers nothing cloud-shaped.
-                app.services.cloud = cloud::service(cc.egui_ctx.clone());
+                // runs on a worker and answers reach the window on a channel.
+                // Without a service the application is local-only and offers
+                // nothing cloud-shaped.
+                if let Some(backend) = cloud::service(cc.egui_ctx.clone()) {
+                    app.cloud.connect(backend);
+                }
                 app.share.connect(collabcraft_share::CollabCraft::from_fn(cloud::client));
                 if let Some(port) = control_port {
                     match control_server::start(port, cc.egui_ctx.clone()) {

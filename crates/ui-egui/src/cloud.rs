@@ -1,27 +1,36 @@
-//! Open and Save against cloud storage.
+//! GridCraft's half of Open and Save against cloud storage.
+//!
+//! The pages themselves are `craft_ui::cloud`. Every Craft app offers the same
+//! ones. What is here is what only GridCraft can answer. A document is a
+//! workbook. These extensions and these content types are what that means.
+//! Bytes become one through `file.open` and go back through `save_bytes`. The
+//! words are the ones `i18n` has.
 //!
 //! GridCraft holds no provider credential and speaks no provider protocol.
-//! Every call goes to the CollabCraft service. That service is the single place
-//! a provider is configured and permissions are decided. Replacing Nextcloud
-//! with something else changes nothing in this file.
+//! Every call goes to the CollabCraft service, which is the single place a
+//! provider is configured and permissions are decided. Replacing Nextcloud
+//! with something else changes nothing here.
 //!
-//! This is the interface half of the work. The host application supplies the
-//! other half as [`crate::Services::cloud`], for two reasons. Every CollabCraft
-//! call blocks, and egui redraws at frame rate. A blocking read of a twenty
-//! megabyte workbook inside a frame would freeze the window for seconds. So
-//! the interface hands the host a [`Job`], the host runs it on a worker
-//! thread, and the answer arrives in an [`Inbox`] that [`pump`] drains on a
-//! later frame. Nothing here opens a socket. The web build therefore still
-//! compiles, and a test drives every flow with no service running.
+//! Nothing in this file opens a socket either. The transport half is a
+//! [`CloudBackend`] the host application supplies (see `apps/gridcraft/cloud`).
+//! Every CollabCraft call blocks. A blocking read of a twenty megabyte
+//! workbook inside a frame would freeze the window for seconds. So the pages
+//! state a [`Job`], the host runs it on a worker thread, and the answer
+//! arrives on a channel that [`pump`] drains on a later frame.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::sync::Arc;
 
-// Re-exported so a host application, and a test, can name the types these
-// jobs carry without depending on the crate they come from.
+// Re-exported so a host application, and a test, can name these types without
+// depending on the crates they come from.
 pub use craft_cloud::{Capability, Entry, EntryKind};
-use egui::{Align2, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
+pub use craft_ui::cloud::{
+    Account, Busy, CloudApp, CloudBackend, CloudFiles, Conflict, CopyFormat, DocumentKind, Event, Fault, Folder, Job, Link, Origin, Post, Source,
+    UNAVAILABLE, available, browse, can_converse, conflict_modal, destination_name, has_target, link, load_shared, open_entry, open_page, origin,
+    parent_of, prefers_cloud, progress, pump, reload_active, save, save_as, save_page, share_button, shares, sign_in, sign_out, start, who,
+    work_together,
+};
+use egui::{Color32, Painter, Rect, Ui};
 use gridcraft_engine::model::Workbook;
 use serde_json::{Value as Json, json};
 
@@ -29,306 +38,65 @@ use crate::icons::{self, Icon};
 use crate::theme::{self, Tokens};
 use crate::{SheetApp, now_ms};
 
-/// How long to wait between asking whether the user has finished linking an
-/// account in their browser.
-const LINK_POLL_MS: f64 = 1500.0;
-
-/// What a command says when no cloud service is configured. Not a failure of
-/// the service: there is no service to fail.
-pub const UNAVAILABLE: &str = "no cloud service is configured";
-
 /// Extensions GridCraft opens. The same set the desktop file picker offers.
 const OPENS: [&str; 9] = ["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "tsv", "txt", "json"];
 
-// ---------------------------------------------------------------- the contract with the host
+/// Content types GridCraft opens, matched against the start of what the
+/// provider said. Read beside the extension because neither is reliable
+/// alone. A WebDAV server hands back `application/octet-stream` for a
+/// perfectly good `.xlsx`, and a file exported by a web application often has
+/// a correct content type and no extension at all.
+const MIMES: [&str; 7] = [
+    "application/vnd.openxmlformats-officedocument.spreadsheetml",
+    "application/vnd.ms-excel",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "text/csv",
+    "text/tab-separated-values",
+    "text/plain",
+    "application/json",
+];
 
-/// Work for the host's worker thread. Each one answers with an [`Event`].
-pub enum Job {
-    /// Who is signed in, and what the provider behind the service can do.
-    Account,
-    /// Begin linking a cloud account. The answer carries a URL to open.
-    LinkStart,
-    /// Whether the user has finished in the browser yet.
-    LinkPoll(String),
-    /// One folder's contents. An empty path is the user's root.
-    List(String),
-    /// Everything other people have shared with this user.
-    SharedWithMe,
-    /// A document's bytes. `into` names the open document a reload replaces.
-    Read { entry: Entry, into: Option<u64> },
-    /// Save back over `entry`, refusing to overwrite a newer version.
-    Write { uid: u64, entry: Entry, bytes: Vec<u8> },
-    /// Save under a new name in `folder`.
-    Create { uid: u64, folder: String, name: String, bytes: Vec<u8> },
-    /// End the session and forget the saved token.
-    SignOut,
-    /// Where to go to work together on a document.
-    Conversation(String),
-}
+/// What a GridCraft document is, as a cloud file list needs to know.
+pub const WORKBOOK: DocumentKind = DocumentKind { extensions: &OPENS, mimes: &MIMES, noun: "workbook", default_extension: "xlsx" };
 
-/// What a worker reports back.
-pub enum Event {
-    /// Where to go to work together, or why there is nowhere.
-    Conversation(Result<craft_cloud::Conversation, Fault>),
-    Account(Result<Account, Fault>),
-    /// A link or a sign-in needs the user's browser. `handle` is polled until
-    /// they are done, when the service gave one.
-    Browser {
-        url: String,
-        handle: Option<String>,
-    },
-    /// `Ok(true)` means the account is linked now.
-    Linked(Result<bool, Fault>),
-    Listed {
-        path: String,
-        entries: Result<Vec<Entry>, Fault>,
-    },
-    Shared(Result<Vec<Entry>, Fault>),
-    Read {
-        entry: Entry,
-        into: Option<u64>,
-        bytes: Result<Vec<u8>, Fault>,
-    },
-    Saved {
-        uid: u64,
-        entry: Result<Entry, Fault>,
-    },
-}
+/// The Save a Copy formats the Share menu offers under the share itself.
+const COPIES: [(&str, &str); 3] =
+    [("xlsx", "Save a Copy as Excel Workbook (.xlsx)…"), ("csv", "Export as CSV…"), ("html", "Export as Web Page (.html)…")];
 
-/// Answers waiting to be read by a frame.
-pub type Inbox = Arc<Mutex<Vec<Event>>>;
-
-/// The host's cloud worker, as the interface sees it.
-pub struct CloudService {
-    /// Hands a job to the worker. This returns at once. The answer arrives in
-    /// `inbox` on a later frame.
-    pub submit: Box<dyn Fn(Job)>,
-    pub inbox: Inbox,
-}
-
-/// What the service said about the signed-in user.
+/// The workbook snapshot each save in flight encoded.
 ///
-/// Capabilities are reported by the service and never assumed here. A provider
-/// without incoming shares hides that side of the Open page. An empty list
-/// where a feature should be reads to a user as a broken window.
-#[derive(Clone, Debug, Default)]
-pub struct Account {
-    pub display: String,
-    pub capabilities: Vec<Capability>,
-    /// Until this is true, Open and Save have nowhere to go.
-    pub provider_linked: bool,
+/// Only GridCraft knows what a version of a workbook is. The pages hold none
+/// of these. A save that succeeds clears the dirty flag for exactly the
+/// version that reached the server. An edit made while the bytes were on the
+/// wire stays unsaved.
+pub type Sent = HashMap<u64, Arc<Workbook>>;
+
+/// Whether GridCraft can open this entry.
+pub fn opens(entry: &Entry) -> bool {
+    craft_ui::cloud::opens(entry, WORKBOOK)
 }
 
-impl Account {
-    pub fn can(&self, capability: Capability) -> bool {
-        self.capabilities.contains(&capability)
-    }
+/// A typed name as a workbook file name. Any folder separators are dropped and
+/// a missing extension becomes `.xlsx`.
+pub fn workbook_name(typed: &str) -> String {
+    craft_ui::cloud::document_name(typed, WORKBOOK)
 }
 
-/// A call that did not succeed, in the shapes the interface acts on
-/// differently.
+/// The whole of the cloud state, for the control channel and for tests.
+pub fn status(app: &SheetApp) -> Json {
+    craft_ui::cloud::report(app)
+}
+
+/// The Share menu's export half, as the control it is drawn in wants it.
+pub fn copies() -> Vec<CopyFormat> {
+    COPIES.iter().map(|(id, label)| CopyFormat::new(*id, *label)).collect()
+}
+
+/// The host part of the service address, for the account menu's first line.
 ///
-/// The client crate reports a refused conditional write as
-/// `Error::Refused { code: "conflict", .. }`. The host maps that onto
-/// [`Fault::Conflict`] here. That one distinction is the point of this type.
-/// A conflict must never be retried and must never be forced.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Fault {
-    /// No cloud account is linked yet. This is a state with an obvious next
-    /// step. It is never drawn as an error.
-    NotLinked,
-    /// Somebody else saved while this user was editing. The save was refused
-    /// and their work is intact.
-    Conflict,
-    /// The session expired. The user signs in again.
-    Unauthenticated,
-    Unreachable(String),
-    Refused(String),
-}
-
-impl Fault {
-    /// One sentence for a person to read.
-    pub fn text(&self) -> String {
-        match self {
-            Fault::NotLinked => "No cloud account is linked yet.".to_owned(),
-            Fault::Conflict => "Somebody else saved this workbook while you were editing it.".to_owned(),
-            Fault::Unauthenticated => "Your cloud session has expired. Sign in again.".to_owned(),
-            Fault::Unreachable(detail) => format!("The cloud service could not be reached. {detail}"),
-            Fault::Refused(detail) => detail.clone(),
-        }
-    }
-
-    /// A short machine-readable name, for the control channel.
-    pub fn code(&self) -> &'static str {
-        match self {
-            Fault::NotLinked => "not_linked",
-            Fault::Conflict => "conflict",
-            Fault::Unauthenticated => "unauthenticated",
-            Fault::Unreachable(_) => "unreachable",
-            Fault::Refused(_) => "refused",
-        }
-    }
-}
-
-// ---------------------------------------------------------------- interface state
-
-/// One folder, as it is being browsed.
-#[derive(Clone, Debug, Default)]
-pub struct Folder {
-    pub path: String,
-    pub entries: Vec<Entry>,
-    pub loading: bool,
-    pub error: Option<Fault>,
-    /// Answered at least once. An empty folder then reads as empty. Without
-    /// this it would read as still loading.
-    pub loaded: bool,
-}
-
-impl Folder {
-    fn begin(&mut self, path: &str) {
-        self.path = path.to_owned();
-        self.entries.clear();
-        self.loading = true;
-        self.loaded = false;
-        self.error = None;
-    }
-
-    fn fill(&mut self, answer: Result<Vec<Entry>, Fault>) {
-        self.loading = false;
-        self.loaded = true;
-        match answer {
-            Ok(entries) => {
-                self.entries = entries;
-                self.error = None;
-            }
-            Err(fault) => {
-                self.entries.clear();
-                self.error = Some(fault);
-            }
-        }
-    }
-}
-
-/// Where the document in this window came from, and the version it came at.
-///
-/// `entry.id` is the opaque handle a save passes back. `entry.etag` is the
-/// version the conditional write is made against. `entry.room` is neither of
-/// those. It is the collaboration identity, and it survives a rename.
-#[derive(Clone, Debug)]
-pub struct Origin {
-    pub entry: Entry,
-}
-
-/// What the interface is waiting for. Drawn as progress while it waits.
-#[derive(Clone, Debug)]
-pub enum Busy {
-    Opening { name: String },
-    Saving { name: String, bytes: usize },
-}
-
-impl Busy {
-    pub fn text(&self) -> String {
-        match self {
-            Busy::Opening { name } => format!("Opening {name}…"),
-            Busy::Saving { name, bytes } => format!("Saving {name} ({})…", size_text(Some(*bytes as u64))),
-        }
-    }
-}
-
-/// A save that was refused because the stored copy had moved on.
-#[derive(Clone, Debug)]
-pub struct Conflict {
-    /// The document that could not be saved.
-    pub uid: u64,
-    pub entry: Entry,
-}
-
-/// Linking a cloud account, which takes a browser round trip.
-#[derive(Clone, Debug)]
-pub enum Link {
-    /// Offered and not started. Never drawn as an error.
-    Offered,
-    Starting,
-    /// The browser is open. `handle` is polled until the user is done.
-    Waiting {
-        url: String,
-        handle: Option<String>,
-        next_poll: f64,
-    },
-    Failed(Fault),
-}
-
-/// Which side of the Open page a selection came from.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Source {
-    #[default]
-    Mine,
-    Shared,
-}
-
-/// Everything the interface keeps about cloud storage.
-#[derive(Default)]
-pub struct Cloud {
-    pub account: Option<Account>,
-    pub account_fault: Option<Fault>,
-    /// The account is asked for once per run. A frame never asks again.
-    asked_account: bool,
-    /// The folder being browsed. Shared by the Open and Save As pages, which
-    /// are never on screen together.
-    pub mine: Folder,
-    pub shared: Folder,
-    pub source: Source,
-    pub busy: Option<Busy>,
-    pub link: Option<Link>,
-    pub conflict: Option<Conflict>,
-    /// Save As: the file name being typed.
-    pub save_name: String,
-    /// Documents that came from the cloud, by document uid.
-    pub origins: HashMap<u64, Origin>,
-    /// The workbook snapshot each save in flight encoded. A save that
-    /// succeeds clears the dirty flag for exactly the version that reached the
-    /// server. An edit made while the bytes were on the wire stays unsaved.
-    sent: HashMap<u64, Arc<Workbook>>,
-    /// The last thing that happened, for the line under the page title.
-    pub status: Option<String>,
-    /// Whether the transfer in flight was started by the share dialog, which
-    /// is waiting to be told how it went.
-    pub sharing_save: bool,
-}
-
-// ---------------------------------------------------------------- asking
-
-/// Whether the host wired a cloud service. When it did not, nothing
-/// cloud-shaped is offered anywhere in the interface.
-pub fn available(app: &SheetApp) -> bool {
-    app.services.cloud.is_some()
-}
-
-/// Hands a job to the host's worker.
-pub fn submit(app: &SheetApp, job: Job) {
-    if let Some(service) = &app.services.cloud {
-        (service.submit)(job);
-    }
-}
-
-/// Asks who is signed in, once per run, and lists the root folder.
-pub fn start(app: &mut SheetApp) {
-    if !available(app) {
-        return;
-    }
-    if !app.cloud.asked_account {
-        app.cloud.asked_account = true;
-        submit(app, Job::Account);
-    }
-    if !app.cloud.mine.loaded && !app.cloud.mine.loading {
-        browse(app, "");
-    }
-}
-
-/// The host part of the service address, for the menu's first line.
-///
-/// Somebody with an account on two deployments needs to know which one a
-/// document is about to land in.
+/// Read from the environment and compiled in nowhere, because the service is
+/// deployment-specific. Somebody with an account on two deployments needs to
+/// know which one a workbook is about to land in.
 fn service_host() -> String {
     ["GRIDCRAFT_CLOUD_URL", "CRAFT_CLOUD_URL", "COLLABCRAFT_URL"]
         .into_iter()
@@ -339,990 +107,137 @@ fn service_host() -> String {
         .unwrap_or_default()
 }
 
-/// The account badge, and the actions behind it.
-///
-/// Drawn only where a service is configured. A build with no service offers
-/// nothing cloud-shaped at all, and a badge that cannot sign anybody in would
-/// be a control that fails on use.
-pub fn account_badge(ui: &mut egui::Ui, app: &mut SheetApp) {
-    if !available(app) {
-        return;
+impl CloudApp for SheetApp {
+    fn cloud(&self) -> &CloudFiles {
+        &self.cloud
     }
-    // Nothing is asked for here. Drawing a badge must not begin a sign-in:
-    // the worker signs in before any job it is given, and it then blocks
-    // polling the browser for minutes. Starting that from a paint call pops a
-    // browser open at launch and leaves every later job queued behind it.
-    // Signing in is a gesture, so it waits for the press below.
-    let known = app.cloud.account.as_ref().map(|a| craft_ui::account::Account {
-        // One account for now. The control already holds a list, so a second
-        // deployment is a second entry here and nothing else changes.
-        id: "default".to_owned(),
-        display: a.display.clone(),
-        email: None,
-        service: service_host(),
-        linked: a.provider_linked,
-    });
-    app.account.set(known.into_iter().collect());
-    app.account.show(ui);
 
-    while let Some(action) = app.account.take_action() {
-        use craft_ui::account::AccountAction as Act;
-        match action {
-            // Signing in and connecting storage are two different things.
-            // Signing in is the device flow against the service, which every
-            // job already triggers when there is no token. Asking who the
-            // account is therefore starts it. Linking storage comes after,
-            // and needs that session to exist first.
-            Act::SignIn | Act::AddAccount => sign_in(app),
-            Act::Link(_) => link(app),
-            Act::SignOut(_) => sign_out(app),
-            // One account, so there is nothing to switch to yet.
-            Act::Use(_) => {}
-            Act::Manage(_) => {
-                let host = service_host();
-                if let Some(open) = &app.services.open_url
-                    && !host.is_empty()
-                {
-                    open(&format!("https://{host}/account"));
-                }
+    fn cloud_mut(&mut self) -> &mut CloudFiles {
+        &mut self.cloud
+    }
+
+    fn kind(&self) -> DocumentKind {
+        WORKBOOK
+    }
+
+    fn active(&self) -> Option<u64> {
+        self.session.active().map(|d| d.uid)
+    }
+
+    fn title(&self, uid: u64) -> String {
+        self.session.documents().iter().find(|d| d.uid == uid).map(|d| d.display_title()).unwrap_or_default()
+    }
+
+    fn open_bytes(&mut self, name: &str, bytes: Vec<u8>) -> Result<Option<u64>, String> {
+        let encoded = gridcraft_engine::io::base64_encode(&bytes);
+        match self.run("file.open", json!({"name": name, "base64": &encoded})) {
+            Ok(result) => {
+                self.backstage = None;
+                self.show_open_warnings(&result);
+                Ok(self.session.active().map(|d| d.uid))
             }
-        }
-    }
-}
-
-/// Begins signing in to the service.
-///
-/// The worker signs in before any job it is given, so asking who the account
-/// is starts the browser flow. The badge says it is working, because the
-/// worker then blocks until the user finishes in the browser and a button
-/// that looks idle for a minute reads as broken.
-pub fn sign_in(app: &mut SheetApp) {
-    if !available(app) {
-        return;
-    }
-    app.account.working();
-    app.cloud.account_fault = None;
-    // Cleared first. A sign-in that failed leaves this set, and a second press
-    // would then be swallowed by the guard that stops a frame asking twice.
-    // A button that does nothing the second time reads as a broken button.
-    app.cloud.asked_account = false;
-    app.cloud.link = None;
-    app.cloud.asked_account = true;
-    app.cloud.status = Some("Finish signing in, in your browser".to_owned());
-    submit(app, Job::Account);
-}
-
-/// Ends the session, here and at the service.
-///
-/// The saved token goes too. Forgetting the account on screen while leaving
-/// the token on disk would sign the user back in on the next run.
-/// Asks where to work together on the open document, then opens it.
-///
-/// Only offered where the provider reports it. A document that has never
-/// been in the cloud has no handle to key a room on, so there is nothing
-/// to ask about either.
-pub fn work_together(app: &mut SheetApp) {
-    if !available(app) {
-        return;
-    }
-    let Some(origin) = origin(app) else {
-        app.cloud.status = Some("Save this workbook to the cloud first".to_owned());
-        return;
-    };
-    converse(app, origin.entry.id.clone());
-}
-
-/// Asks the provider where to work together on one document.
-fn converse(app: &mut SheetApp, id: String) {
-    app.cloud.status = Some("Opening a conversation".to_owned());
-    submit(app, Job::Conversation(id));
-}
-
-/// Whether the provider offers somewhere to talk about a document.
-pub fn can_converse(app: &SheetApp) -> bool {
-    app.cloud.account.as_ref().is_some_and(|a| a.capabilities.contains(&Capability::Conversation))
-}
-
-pub fn sign_out(app: &mut SheetApp) {
-    app.cloud.account = None;
-    app.cloud.account_fault = None;
-    app.cloud.asked_account = false;
-    app.cloud.link = None;
-    app.cloud.mine = Folder::default();
-    app.cloud.shared = Folder::default();
-    app.cloud.origins.clear();
-    app.cloud.status = Some("Signed out".to_owned());
-    submit(app, Job::SignOut);
-}
-
-/// Lists one folder. An empty path is the user's root.
-pub fn browse(app: &mut SheetApp, path: &str) {
-    if !available(app) {
-        return;
-    }
-    app.cloud.mine.begin(path);
-    submit(app, Job::List(path.to_owned()));
-}
-
-/// Lists what other people have shared with this user.
-pub fn load_shared(app: &mut SheetApp) {
-    if !available(app) {
-        return;
-    }
-    app.cloud.shared.begin("");
-    submit(app, Job::SharedWithMe);
-}
-
-/// Begins linking a cloud account.
-pub fn link(app: &mut SheetApp) {
-    if !available(app) {
-        return;
-    }
-    app.cloud.link = Some(Link::Starting);
-    submit(app, Job::LinkStart);
-}
-
-/// The parent of a path. `None` at the root.
-pub fn parent_of(path: &str) -> Option<String> {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.rfind('/') {
-        Some(0) | None => Some(String::new()),
-        Some(cut) => Some(trimmed[..cut].to_owned()),
-    }
-}
-
-/// Whether GridCraft can open this entry, judged by its extension and by what
-/// the provider says it is.
-///
-/// Both signals are read because neither is reliable alone. A WebDAV server
-/// hands back `application/octet-stream` for a perfectly good `.xlsx`. A file
-/// exported by a web application often has a correct content type and no
-/// extension at all.
-pub fn opens(entry: &Entry) -> bool {
-    if entry.kind == EntryKind::Folder {
-        return false;
-    }
-    let extension = entry.name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    let by_name = extension.is_some_and(|e| OPENS.contains(&e.as_str()));
-    by_name || entry.mime.as_deref().is_some_and(mime_opens)
-}
-
-fn mime_opens(mime: &str) -> bool {
-    let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-    mime.starts_with("application/vnd.openxmlformats-officedocument.spreadsheetml")
-        || mime.starts_with("application/vnd.ms-excel")
-        || mime == "application/vnd.oasis.opendocument.spreadsheet"
-        || mime == "text/csv"
-        || mime == "text/tab-separated-values"
-        || mime == "text/plain"
-        || mime == "application/json"
-}
-
-// ---------------------------------------------------------------- opening
-
-/// Reads a document and opens it. `into` names an open document the bytes
-/// replace, which is how a reload after a conflict works.
-pub fn open_entry(app: &mut SheetApp, entry: Entry, into: Option<u64>) {
-    if !available(app) || app.cloud.busy.is_some() {
-        return;
-    }
-    app.cloud.status = None;
-    app.cloud.busy = Some(Busy::Opening { name: entry.name.clone() });
-    submit(app, Job::Read { entry, into });
-}
-
-/// Reads the active document's stored copy again. Local edits are discarded.
-pub fn reload_active(app: &mut SheetApp) -> Result<Json, String> {
-    let Some(uid) = app.session.active().map(|d| d.uid) else { return Err("no workbook open".to_owned()) };
-    let Some(origin) = app.cloud.origins.get(&uid).cloned() else { return Err("this workbook did not come from the cloud".to_owned()) };
-    app.cloud.conflict = None;
-    let name = origin.entry.name.clone();
-    open_entry(app, origin.entry, Some(uid));
-    Ok(json!({"reloading": name}))
-}
-
-// ---------------------------------------------------------------- saving
-
-/// The cloud document the active workbook came from, when it came from one.
-pub fn origin(app: &SheetApp) -> Option<&Origin> {
-    let uid = app.session.active()?.uid;
-    app.cloud.origins.get(&uid)
-}
-
-/// Whether Save has somewhere to go without asking. The Backstage view uses
-/// this to choose between Save and the Save As page.
-pub fn has_target(app: &SheetApp) -> bool {
-    origin(app).is_some_and(|o| o.entry.writable)
-}
-
-/// Encodes the active workbook as xlsx. The snapshot that produced the bytes
-/// comes back with them, so a successful save clears the dirty flag for
-/// exactly that version.
-fn encode(app: &SheetApp) -> Result<(Arc<Workbook>, Vec<u8>), String> {
-    let doc = app.session.active().ok_or("no workbook open")?;
-    let bytes = gridcraft_engine::io::save_bytes(&doc.wb, "workbook.xlsx").map_err(|e| e.to_string())?;
-    Ok((doc.wb.clone(), bytes))
-}
-
-/// Save: writes back over the entry this workbook came from.
-///
-/// The etag the document was read at goes out as the condition. A server whose
-/// copy has moved on refuses the write. That arrives as [`Fault::Conflict`]
-/// and is put to the user. It is never retried.
-pub fn save(app: &mut SheetApp) -> Result<Json, String> {
-    let uid = app.session.active().map(|d| d.uid).ok_or("no workbook open")?;
-    let origin = app.cloud.origins.get(&uid).cloned().ok_or("this workbook did not come from the cloud")?;
-    if !origin.entry.writable {
-        return Err("this document was shared with you for reading only. Save As keeps a copy of your own.".to_owned());
-    }
-    if app.cloud.busy.is_some() {
-        return Err("a cloud transfer is already running".to_owned());
-    }
-    let (snapshot, bytes) = encode(app)?;
-    let size = bytes.len();
-    app.cloud.sent.insert(uid, snapshot);
-    app.cloud.status = None;
-    app.cloud.busy = Some(Busy::Saving { name: origin.entry.name.clone(), bytes: size });
-    let answer = json!({"saving": origin.entry.name, "bytes": size, "ifMatch": origin.entry.etag});
-    submit(app, Job::Write { uid, entry: origin.entry, bytes });
-    Ok(answer)
-}
-
-/// Save As: writes a new document into `folder` under `name`.
-pub fn save_as(app: &mut SheetApp, folder: &str, name: &str) -> Result<Json, String> {
-    let uid = app.session.active().map(|d| d.uid).ok_or("no workbook open")?;
-    let name = workbook_name(name);
-    if name.is_empty() {
-        return Err("type a file name".to_owned());
-    }
-    if app.cloud.busy.is_some() {
-        return Err("a cloud transfer is already running".to_owned());
-    }
-    let (snapshot, bytes) = encode(app)?;
-    let size = bytes.len();
-    app.cloud.sent.insert(uid, snapshot);
-    app.cloud.status = None;
-    app.cloud.busy = Some(Busy::Saving { name: name.clone(), bytes: size });
-    let answer = json!({"saving": name, "folder": folder, "bytes": size});
-    submit(app, Job::Create { uid, folder: folder.to_owned(), name, bytes });
-    Ok(answer)
-}
-
-/// A typed name as a workbook file name. Any folder separators are dropped and
-/// a missing extension becomes `.xlsx`.
-pub fn workbook_name(typed: &str) -> String {
-    let base = typed.rsplit(['/', '\\']).next().unwrap_or("").trim();
-    if base.is_empty() {
-        return String::new();
-    }
-    let known = base.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && OPENS.contains(&ext.to_ascii_lowercase().as_str()));
-    if known { base.to_owned() } else { format!("{base}.xlsx") }
-}
-
-// ---------------------------------------------------------------- reading the answers
-
-/// Drains the host's inbox and keeps a link or a transfer moving. Called once
-/// a frame, before anything is drawn.
-pub fn pump(app: &mut SheetApp, ctx: &egui::Context) {
-    if !available(app) {
-        return;
-    }
-    let arrived: Vec<Event> =
-        app.services.cloud.as_ref().map(|c| std::mem::take(&mut *c.inbox.lock().unwrap_or_else(PoisonError::into_inner))).unwrap_or_default();
-    for event in arrived {
-        apply(app, event);
-    }
-    poll_link(app);
-    // A worker answering is not a local event. Without this the progress line
-    // would sit frozen until the user moved the mouse.
-    if app.cloud.busy.is_some() || matches!(app.cloud.link, Some(Link::Starting | Link::Waiting { .. })) {
-        ctx.request_repaint_after(Duration::from_millis(120));
-    }
-}
-
-fn apply(app: &mut SheetApp, event: Event) {
-    match event {
-        Event::Account(Ok(account)) => {
-            let linked = account.provider_linked;
-            // Who is signed in has changed, so what the provider can do
-            // may have changed with it. The dialog keeps its first
-            // answer, and on a cold start that answer is "nobody is
-            // signed in".
-            app.share.refresh();
-            app.cloud.account = Some(account);
-            app.cloud.account_fault = None;
-            if linked {
-                app.cloud.link = None;
-            } else if app.cloud.link.is_none() {
-                app.cloud.link = Some(Link::Offered);
+            // Protected bytes are not a workbook until a password arrives.
+            // The prompt carries them on. Nothing is said about them yet.
+            Err(error) if error.contains(gridcraft_engine::io::PASSWORD_REQUIRED) => {
+                self.backstage = None;
+                self.open_dialog("openPassword", json!({"name": name, "base64": encoded}));
+                Ok(None)
             }
-        }
-        // No account linked yet is a state with an obvious next step. It is an
-        // offer to link, and never an error message.
-        Event::Account(Err(Fault::NotLinked)) => {
-            app.cloud.account_fault = None;
-            if app.cloud.link.is_none() {
-                app.cloud.link = Some(Link::Offered);
-            }
-        }
-        Event::Conversation(Ok(conversation)) => {
-            app.cloud.status = Some(format!("Opened in {}", conversation.name));
-            if let Some(open) = &app.services.open_url {
-                open(&conversation.url);
-            }
-        }
-        Event::Conversation(Err(fault)) => {
-            app.cloud.status = Some(fault.text());
-        }
-        Event::Account(Err(fault)) => app.cloud.account_fault = Some(fault),
-        Event::Browser { url, handle } => {
-            if let Some(open) = &app.services.open_url {
-                open(&url);
-            }
-            app.cloud.link = Some(Link::Waiting { url, handle, next_poll: now_ms() + LINK_POLL_MS });
-        }
-        Event::Linked(Ok(true)) => {
-            // Storage just arrived, so ask what it can do.
-            app.share.refresh();
-            app.cloud.link = None;
-            app.cloud.status = Some("Cloud account linked.".to_owned());
-            app.cloud.asked_account = false;
-            submit(app, Job::Account);
-            browse(app, "");
-            app.cloud.shared.loaded = false;
-        }
-        // The ordinary answer while the user is still in the browser.
-        Event::Linked(Ok(false)) | Event::Linked(Err(Fault::NotLinked)) => {}
-        Event::Linked(Err(fault)) => app.cloud.link = Some(Link::Failed(fault)),
-        Event::Listed { path, entries } => {
-            if path == app.cloud.mine.path {
-                app.cloud.mine.fill(entries);
-            }
-        }
-        Event::Shared(entries) => app.cloud.shared.fill(entries),
-        Event::Read { entry, into, bytes } => {
-            app.cloud.busy = None;
-            match bytes {
-                Ok(bytes) => opened(app, entry, into, bytes),
-                Err(Fault::NotLinked) => app.cloud.link = Some(Link::Offered),
-                Err(fault) => app.message = Some(("GridCraft".to_owned(), format!("{} could not be opened. {}", entry.name, fault.text()))),
-            }
-        }
-        Event::Saved { uid, entry } => {
-            app.cloud.busy = None;
-            let snapshot = app.cloud.sent.remove(&uid);
-            match entry {
-                Ok(entry) => {
-                    if let Some(snapshot) = snapshot {
-                        clean(app, uid, snapshot);
-                    }
-                    stored(app, uid, entry);
-                }
-                // The one failure that must never be retried and never forced.
-                Err(Fault::Conflict) => match app.cloud.origins.get(&uid).cloned() {
-                    Some(origin) => app.cloud.conflict = Some(Conflict { uid, entry: origin.entry }),
-                    None => app.message = Some(("GridCraft".to_owned(), Fault::Conflict.text())),
-                },
-                Err(Fault::NotLinked) => app.cloud.link = Some(Link::Offered),
-                Err(fault) => app.message = Some(("GridCraft".to_owned(), format!("The workbook was not saved. {}", fault.text()))),
-            }
+            Err(error) => Err(crate::clean_error(&error)),
         }
     }
-}
 
-/// Bytes arrived. They open through the ordinary open path, and the document
-/// remembers where they came from.
-fn opened(app: &mut SheetApp, entry: Entry, into: Option<u64>, bytes: Vec<u8>) {
-    let encoded = gridcraft_engine::io::base64_encode(&bytes);
-    match app.run("file.open", json!({"name": entry.name, "base64": encoded})) {
-        Ok(result) => {
-            app.backstage = None;
-            app.show_open_warnings(&result);
-            let now = app.session.active().map(|d| d.uid);
-            if let Some(uid) = now {
-                app.cloud.origins.insert(uid, Origin { entry: entry.clone() });
-            }
-            // A reload closes the document it replaced only once the new one
-            // is open. A read that fails leaves the user's work where it was.
-            let stale = into.filter(|old| Some(*old) != now);
-            if let Some(old) = stale
-                && let Some(index) = app.session.documents().iter().position(|d| d.uid == old)
-            {
-                app.cloud.origins.remove(&old);
-                app.cloud.sent.remove(&old);
-                app.session.close_document(index);
-            }
-            app.cloud.status = Some(format!("Opened {} from the cloud.", entry.name));
-        }
-        Err(error) if error.contains(gridcraft_engine::io::PASSWORD_REQUIRED) => {
-            app.backstage = None;
-            app.open_dialog("openPassword", json!({"name": entry.name, "base64": gridcraft_engine::io::base64_encode(&bytes)}));
-        }
-        Err(error) => app.message = Some(("GridCraft".to_owned(), crate::clean_error(&error))),
+    fn encode(&mut self, uid: u64) -> Result<Vec<u8>, String> {
+        let doc = self.session.documents().iter().find(|d| d.uid == uid).ok_or("no workbook open")?;
+        let snapshot = doc.wb.clone();
+        let bytes = gridcraft_engine::io::save_bytes(&snapshot, "workbook.xlsx").map_err(|e| e.to_string())?;
+        self.cloud_sent.insert(uid, snapshot);
+        Ok(bytes)
     }
-}
 
-/// A save landed. The document now belongs to the entry the server returned,
-/// at the version it returned.
-fn stored(app: &mut SheetApp, uid: u64, entry: Entry) {
-    app.cloud.conflict = None;
-    app.cloud.status = Some(format!("Saved {} to the cloud.", entry.name));
-    app.toast = Some((format!("Saved {} to the cloud", entry.name), now_ms()));
-    app.cloud.origins.insert(uid, Origin { entry });
-}
+    fn close(&mut self, uid: u64) {
+        if let Some(index) = self.session.documents().iter().position(|d| d.uid == uid) {
+            self.session.close_document(index);
+        }
+    }
 
-/// Marks the version that reached the server as the saved one.
-///
-/// An edit made while the bytes were in flight keeps the workbook dirty, which
-/// is what the title bar and the close prompt go by.
-fn clean(app: &mut SheetApp, uid: u64, snapshot: Arc<Workbook>) {
-    if let Some(doc) = app.session.document_mut(uid) {
-        doc.saved = snapshot;
+    fn mark_saved(&mut self, uid: u64) {
+        let Some(snapshot) = self.cloud_sent.remove(&uid) else { return };
+        if let Some(doc) = self.session.document_mut(uid) {
+            doc.saved = snapshot;
+        }
     }
-}
 
-/// Keeps asking whether the user has finished linking in their browser.
-fn poll_link(app: &mut SheetApp) {
-    let now = now_ms();
-    let Some(Link::Waiting { handle: Some(handle), next_poll, .. }) = &mut app.cloud.link else { return };
-    if now < *next_poll {
-        return;
+    fn drop_pending(&mut self, uid: u64) {
+        self.cloud_sent.remove(&uid);
     }
-    *next_poll = now + LINK_POLL_MS;
-    let handle = handle.clone();
-    submit(app, Job::LinkPoll(handle));
-}
 
-/// The whole of the cloud state, for the control channel and for tests.
-pub fn status(app: &SheetApp) -> Json {
-    let account = app.cloud.account.as_ref().map(|a| {
-        json!({
-            "display": a.display,
-            "providerLinked": a.provider_linked,
-            "capabilities": a.capabilities.iter().map(|c| serde_json::to_value(c).unwrap_or_default()).collect::<Vec<_>>(),
-        })
-    });
-    let came_from = origin(app)
-        .map(|o| json!({"id": o.entry.id, "room": o.entry.room, "name": o.entry.name, "etag": o.entry.etag, "writable": o.entry.writable}));
-    json!({
-        "available": available(app),
-        "account": account,
-        "accountError": app.cloud.account_fault.as_ref().map(Fault::code),
-        "folder": app.cloud.mine.path,
-        "entries": app.cloud.mine.entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
-        "openable": app.cloud.mine.entries.iter().filter(|e| opens(e)).map(|e| e.name.clone()).collect::<Vec<_>>(),
-        "shared": app.cloud.shared.entries.iter().map(|e| json!({"name": e.name, "sharedBy": e.shared_by, "writable": e.writable, "openable": opens(e)})).collect::<Vec<_>>(),
-        "busy": app.cloud.busy.as_ref().map(Busy::text),
-        "link": match &app.cloud.link {
-            None => Json::Null,
-            Some(Link::Offered) => json!("offered"),
-            Some(Link::Starting) => json!("starting"),
-            Some(Link::Waiting { url, .. }) => json!({"waiting": url}),
-            Some(Link::Failed(fault)) => json!({"failed": fault.code()}),
-        },
-        "conflict": app.cloud.conflict.as_ref().map(|c| json!({"name": c.entry.name})),
-        "origin": came_from,
-        "status": app.cloud.status,
-    })
-}
+    fn ready_to_save(&mut self) -> bool {
+        // A save has to include the cell the user is still typing in.
+        self.commit_edit(0, 0, false, false)
+    }
 
-// ---------------------------------------------------------------- drawing
+    fn sharing(&mut self) -> &mut craft_ui::share::ShareDialog {
+        &mut self.share
+    }
 
-fn dim(ui: &mut Ui, text: &str) {
-    let t = Tokens::get(ui.ctx());
-    ui.label(RichText::new(text).font(theme::ui_font(12.5)).color(t.text_dim));
-}
+    fn presence(&mut self) -> &mut craft_ui::presence::PresenceBar {
+        &mut self.presence
+    }
 
-/// Bytes as a person reads them.
-fn size_text(bytes: Option<u64>) -> String {
-    let Some(bytes) = bytes else { return String::new() };
-    const UNITS: [&str; 4] = ["bytes", "KB", "MB", "GB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit + 1 < UNITS.len() {
-        size /= 1024.0;
-        unit += 1;
+    fn paint_icon(&self, painter: &Painter, rect: Rect, kind: EntryKind, colour: Color32) {
+        let icon = if kind == EntryKind::Folder { Icon::Folder } else { Icon::Book };
+        icons::paint(painter, rect, icon, colour);
     }
-    match UNITS.get(unit) {
-        Some(name) if unit > 0 => format!("{size:.1} {name}"),
-        _ => format!("{bytes} bytes"),
-    }
-}
 
-/// One row in a file list, with a second line for the detail that matters on
-/// that side of the page (a size for your own files, who shared it for
-/// somebody else's).
-fn entry_row(ui: &mut Ui, entry: &Entry, detail: &str, reserve: f32) -> egui::Response {
-    let t = Tokens::get(ui.ctx());
-    let width = (ui.available_width() - reserve).max(60.0);
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 40.0), Sense::click());
-    let label = entry.name.clone();
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
-    let p = ui.painter();
-    if resp.hovered() {
-        p.rect_filled(rect, 4.0, t.hover);
+    fn open_url(&self, url: &str) {
+        if let Some(open) = &self.services.open_url {
+            open(url);
+        }
     }
-    let icon = if entry.kind == EntryKind::Folder { Icon::Folder } else { Icon::Book };
-    icons::paint(p, Rect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), vec2(18.0, 18.0)), icon, t.text);
-    let (name_y, detail_y) = if detail.is_empty() { (rect.center().y, rect.center().y) } else { (rect.center().y - 8.0, rect.center().y + 9.0) };
-    p.text(pos2(rect.left() + 38.0, name_y), Align2::LEFT_CENTER, &entry.name, theme::ui_font(13.0), t.text);
-    if !detail.is_empty() {
-        p.text(pos2(rect.left() + 38.0, detail_y), Align2::LEFT_CENTER, detail, theme::ui_font(11.0), t.text_dim);
-    }
-    resp
-}
 
-/// The character a label ends with when choosing it opens a dialog.
-const ELLIPSIS: &str = "\u{2026}";
+    fn say(&mut self, text: String) {
+        self.message = Some(("GridCraft".to_owned(), text));
+    }
 
-/// The `…` beside a document, and what a person chose from it.
-///
-/// Only the actions the provider actually offers appear. A greyed-out item says
-/// the action exists and is not possible right now. An absent one says this
-/// provider does not do that at all, and those are different facts.
-fn row_actions(app: &SheetApp, ui: &mut Ui, entry: &Entry) -> Option<String> {
-    let lang = app.ui.language;
-    let can = |c: Capability| app.cloud.account.as_ref().is_some_and(|a| a.can(c));
-    let mut items = vec![craft_ui::menu::MenuItem::new("open", lang.tr("Open"))];
-    if can(Capability::Sharing) {
-        items.push(
-            craft_ui::menu::MenuItem::new("share", format!("{}{}", lang.tr("Share"), ELLIPSIS))
-                .detail(lang.tr("See who this is shared with, and invite somebody"))
-                .separated(),
-        );
+    fn toast(&mut self, text: String) {
+        self.toast = Some((text, now_ms()));
     }
-    if can(Capability::Conversation) {
-        items.push(craft_ui::menu::MenuItem::new("talk", lang.tr("Work together")).detail(lang.tr("Open a conversation about this document")));
-    }
-    let labels = craft_ui::menu::MenuLabels { more: lang.tr("More options").to_owned(), ..Default::default() };
-    // Salted by the handle. Two rows drawing the same control need two menus,
-    // and the handle is the one thing that differs between them.
-    ui.push_id(entry.id.clone(), |ui| craft_ui::menu::overflow(ui, &items, &labels)).inner
-}
 
-/// A bordered column with a heading. This is how the two Open sources sit side
-/// by side.
-fn column(ui: &mut Ui, heading: &str, body: impl FnOnce(&mut Ui)) {
-    let t = Tokens::get(ui.ctx());
-    egui::Frame::NONE.fill(t.ribbon).stroke(Stroke::new(1.0, t.ribbon_border)).corner_radius(6.0).inner_margin(10).show(ui, |ui| {
-        ui.label(RichText::new(heading).font(theme::ui_bold(13.0)).color(t.text));
-        ui.add_space(6.0);
-        egui::ScrollArea::vertical().id_salt(heading.to_owned()).max_height(300.0).auto_shrink([false, false]).show(ui, body);
-    });
-}
-
-/// The account line, or the reason there is nothing to show yet.
-fn header(app: &mut SheetApp, ui: &mut Ui) {
-    let lang = app.ui.language;
-    let mut retry = false;
-    match (&app.cloud.account, &app.cloud.account_fault) {
-        (_, Some(fault)) => {
-            let text = fault.text();
-            ui.horizontal(|ui| {
-                dim(ui, &text);
-                if ui.button(lang.tr("Try again")).clicked() {
-                    retry = true;
-                }
-            });
-        }
-        (Some(account), None) => {
-            let line = if account.display.is_empty() { lang.tr("Signed in").to_owned() } else { account.display.clone() };
-            dim(ui, &line);
-        }
-        (None, None) => dim(ui, lang.tr("Connecting to your cloud account…")),
-    }
-    if retry {
-        app.cloud.account_fault = None;
-        app.cloud.asked_account = false;
-        start(app);
-    }
-}
-
-/// The offer to link an account, and the wait while the browser is open.
-/// Returns true when it drew, because there is nothing else to show until an
-/// account exists.
-///
-/// None of this is an error. The whole state means one thing: there is no
-/// account yet, and linking one is a button away.
-fn link_panel(app: &mut SheetApp, ui: &mut Ui) -> bool {
-    let lang = app.ui.language;
-    let Some(state) = app.cloud.link.clone() else { return false };
-    let t = Tokens::get(ui.ctx());
-    let mut begin = false;
-    let mut cancel = false;
-    let mut browse_to: Option<String> = None;
-    egui::Frame::NONE.fill(t.accent_soft).corner_radius(6.0).inner_margin(12).show(ui, |ui| match state {
-        Link::Offered => {
-            ui.label(RichText::new(lang.tr("No cloud account is linked yet.")).font(theme::ui_bold(13.0)).color(t.text));
-            dim(ui, lang.tr("Link one to open and save workbooks in your cloud storage."));
-            ui.add_space(8.0);
-            begin = ui.button(lang.tr("Link a cloud account")).clicked();
-        }
-        Link::Starting => {
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(14.0));
-                dim(ui, lang.tr("Starting…"));
-            });
-        }
-        Link::Waiting { url, .. } => {
-            ui.label(RichText::new(lang.tr("Finish linking in your browser.")).font(theme::ui_bold(13.0)).color(t.text));
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(14.0));
-                dim(ui, lang.tr("Waiting for your browser…"));
-            });
-            ui.add_space(6.0);
-            // A link alone is not enough. When the browser cannot be opened,
-            // or opens the wrong thing, the only way out is carrying the
-            // address across by hand, and a label cannot be selected.
-            ui.horizontal(|ui| {
-                if ui.button(lang.tr("Open in browser")).clicked() {
-                    browse_to = Some(url.clone());
-                }
-                if ui.button(lang.tr("Copy link")).clicked() {
-                    ui.ctx().copy_text(url.clone());
-                }
-            });
-            ui.add_space(4.0);
-            if ui.link(&url).clicked() {
-                browse_to = Some(url.clone());
-            }
-            ui.add_space(8.0);
-            cancel = ui.button(lang.tr("Cancel")).clicked();
-        }
-        Link::Failed(fault) => {
-            ui.label(RichText::new(fault.text()).font(theme::ui_font(13.0)).color(t.text));
-            ui.add_space(8.0);
-            begin = ui.button(lang.tr("Try again")).clicked();
-        }
-    });
-    if let Some(url) = browse_to
-        && let Some(open) = &app.services.open_url
-    {
-        open(&url);
-    }
-    if begin {
-        link(app);
-    } else if cancel {
-        app.cloud.link = Some(Link::Offered);
-    }
-    true
-}
-
-/// The progress line for a read or a write in flight.
-pub fn progress(app: &SheetApp, ui: &mut Ui) {
-    let Some(busy) = app.cloud.busy.clone() else { return };
-    let t = Tokens::get(ui.ctx());
-    ui.horizontal(|ui| {
-        ui.add(egui::Spinner::new().size(15.0));
-        ui.label(RichText::new(busy.text()).font(theme::ui_font(12.5)).color(t.text));
-    });
-}
-
-/// File › Open, the cloud part. Your own files sit on one side and what other
-/// people shared with you sits on the other.
-/// What an overflow menu asked for, deferred until the list is no longer
-/// being drawn. Opening a dialog while borrowing the list is not possible.
-enum Act {
-    Share(Entry),
-    Talk(Entry),
-}
-
-pub fn open_page(app: &mut SheetApp, ui: &mut Ui) {
-    start(app);
-    header(app, ui);
-    ui.add_space(8.0);
-    if link_panel(app, ui) {
-        return;
-    }
-    progress(app, ui);
-    // Hidden where the provider has no incoming shares at all. An empty list
-    // under that heading would read as a broken feature.
-    let shared_offered = app.cloud.account.as_ref().is_some_and(|a| a.can(Capability::SharedWithMe));
-    if shared_offered && !app.cloud.shared.loaded && !app.cloud.shared.loading {
-        load_shared(app);
-    }
-    let mut pick: Option<(Entry, Source)> = None;
-    let mut go: Option<String> = None;
-    let mut act: Option<Act> = None;
-    if shared_offered {
-        ui.columns(2, |columns| {
-            if let Some(ui) = columns.get_mut(0) {
-                my_files(app, ui, &mut pick, &mut go, &mut act);
-            }
-            if let Some(ui) = columns.get_mut(1) {
-                shared_files(app, ui, &mut pick, &mut act);
-            }
-        });
-    } else {
-        my_files(app, ui, &mut pick, &mut go, &mut act);
-    }
-    match act {
-        // Sharing a document in the list, which is not the one that happens to
-        // be open. The dialog is told which.
-        Some(Act::Share(entry)) => app.share.open(entry.id.clone(), entry.name.clone()),
-        Some(Act::Talk(entry)) => converse(app, entry.id.clone()),
-        None => {}
-    }
-    if let Some(path) = go {
-        browse(app, &path);
-    } else if let Some((entry, source)) = pick {
-        app.cloud.source = source;
-        open_entry(app, entry, None);
-    }
-    if let Some(status) = app.cloud.status.clone() {
-        ui.add_space(10.0);
-        dim(ui, &status);
-    }
-}
-
-/// Your own files: where you are, a way up, then the folders and the documents
-/// GridCraft can open.
-fn my_files(app: &mut SheetApp, ui: &mut Ui, pick: &mut Option<(Entry, Source)>, go: &mut Option<String>, act: &mut Option<Act>) {
-    let lang = app.ui.language;
-    let folder = app.cloud.mine.clone();
-    column(ui, lang.tr("My files"), |ui| {
-        let here = if folder.path.is_empty() { lang.tr("Home").to_owned() } else { folder.path.clone() };
-        ui.horizontal(|ui| {
-            if let Some(up) = parent_of(&folder.path)
-                && ui.button(lang.tr("Up")).clicked()
-            {
-                *go = Some(up);
-            }
-            dim(ui, &here);
-        });
-        ui.add_space(4.0);
-        if folder.loading {
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(14.0));
-                dim(ui, lang.tr("Loading…"));
-            });
-            return;
-        }
-        if let Some(fault) = &folder.error {
-            dim(ui, &fault.text());
-            return;
-        }
-        let mut shown = 0;
-        for entry in &folder.entries {
-            let is_folder = entry.kind == EntryKind::Folder;
-            if !is_folder && !opens(entry) {
-                continue;
-            }
-            shown += 1;
-            let detail = if is_folder { String::new() } else { size_text(entry.size) };
-            // A folder has nothing behind an ellipsis. Opening it is the only
-            // thing to do with one here.
-            let reserve = if is_folder { 0.0 } else { 26.0 };
-            let (row, chose) = ui
-                .horizontal(|ui| {
-                    let row = entry_row(ui, entry, &detail, reserve).clicked();
-                    let chose = if is_folder { None } else { row_actions(app, ui, entry) };
-                    (row, chose)
-                })
-                .inner;
-            match chose.as_deref() {
-                Some("share") => *act = Some(Act::Share(entry.clone())),
-                Some("talk") => *act = Some(Act::Talk(entry.clone())),
-                Some("open") => *pick = Some((entry.clone(), Source::Mine)),
-                _ if row => {
-                    if is_folder {
-                        *go = Some(entry.path.clone());
-                    } else {
-                        *pick = Some((entry.clone(), Source::Mine));
-                    }
-                }
-                _ => {}
-            }
-        }
-        if shown == 0 && folder.loaded {
-            dim(ui, lang.tr("Nothing here that GridCraft can open."));
-        }
-    });
-}
-
-/// What other people shared with you. One flat list, because an incoming share
-/// has no folder of yours to sit in. Each row says who shared it.
-fn shared_files(app: &mut SheetApp, ui: &mut Ui, pick: &mut Option<(Entry, Source)>, act: &mut Option<Act>) {
-    let lang = app.ui.language;
-    let shared = app.cloud.shared.clone();
-    column(ui, lang.tr("Shared with me"), |ui| {
-        if shared.loading {
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(14.0));
-                dim(ui, lang.tr("Loading…"));
-            });
-            return;
-        }
-        if let Some(fault) = &shared.error {
-            dim(ui, &fault.text());
-            return;
-        }
-        let mut shown = 0;
-        for entry in shared.entries.iter().filter(|e| opens(e)) {
-            shown += 1;
-            let who = entry.shared_by.clone().unwrap_or_else(|| lang.tr("Shared with you").to_owned());
-            let detail = if entry.writable { who } else { format!("{who} ({})", lang.tr("read-only")) };
-            let (row, chose) = ui
-                .horizontal(|ui| {
-                    let row = entry_row(ui, entry, &detail, 26.0).clicked();
-                    (row, row_actions(app, ui, entry))
-                })
-                .inner;
-            match chose.as_deref() {
-                Some("share") => *act = Some(Act::Share(entry.clone())),
-                Some("talk") => *act = Some(Act::Talk(entry.clone())),
-                _ if row || chose.is_some() => *pick = Some((entry.clone(), Source::Shared)),
-                _ => {}
-            }
-        }
-        if shown == 0 && shared.loaded {
-            dim(ui, lang.tr("Nobody has shared a workbook with you."));
-        }
-    });
-}
-
-/// File › Save As, the cloud destination. Pick a folder, name the file, save.
-/// Returns true when a save started, so the Backstage view can return to the
-/// sheet.
-pub fn save_page(app: &mut SheetApp, ui: &mut Ui) -> bool {
-    let lang = app.ui.language;
-    start(app);
-    // The destination above already names the account. This line is here to
-    // say when something is wrong with it.
-    if app.cloud.account.is_none() || app.cloud.account_fault.is_some() {
-        header(app, ui);
-        ui.add_space(8.0);
-    }
-    if link_panel(app, ui) {
-        return false;
-    }
-    progress(app, ui);
-    if app.cloud.save_name.is_empty() {
-        let suggested = app.session.active().map(|d| d.display_title()).unwrap_or_else(|| "Book1".to_owned());
-        app.cloud.save_name = workbook_name(&suggested);
-    }
-    let folder = app.cloud.mine.clone();
-    let mut go: Option<String> = None;
-    column(ui, lang.tr("Folder"), |ui| {
-        let here = if folder.path.is_empty() { lang.tr("Home").to_owned() } else { folder.path.clone() };
-        ui.horizontal(|ui| {
-            if let Some(up) = parent_of(&folder.path)
-                && ui.button(lang.tr("Up")).clicked()
-            {
-                go = Some(up);
-            }
-            dim(ui, &here);
-        });
-        ui.add_space(4.0);
-        if folder.loading {
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(14.0));
-                dim(ui, lang.tr("Loading…"));
-            });
-            return;
-        }
-        if let Some(fault) = &folder.error {
-            dim(ui, &fault.text());
-            return;
-        }
-        let mut folders = 0;
-        for entry in folder.entries.iter().filter(|e| e.kind == EntryKind::Folder) {
-            folders += 1;
-            if entry_row(ui, entry, "", 0.0).clicked() {
-                go = Some(entry.path.clone());
-            }
-        }
-        if folders == 0 && folder.loaded {
-            dim(ui, lang.tr("No folders here. The workbook saves in this one."));
-        }
-    });
-    if let Some(path) = go {
-        browse(app, &path);
-    }
-    ui.add_space(12.0);
-    let mut asked = false;
-    ui.horizontal(|ui| {
-        ui.label(lang.tr("File name"));
-        let typing = ui.add(egui::TextEdit::singleline(&mut app.cloud.save_name).desired_width(280.0));
-        asked = typing.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-    });
-    ui.add_space(10.0);
-    let ready = app.cloud.busy.is_none() && !workbook_name(&app.cloud.save_name).is_empty();
-    if ui.add_enabled(ready, egui::Button::new(lang.tr("Save to the cloud"))).clicked() {
-        asked = true;
-    }
-    ui.add_space(8.0);
-    dim(ui, lang.tr("The workbook is saved as an Excel workbook (.xlsx) in the folder above."));
-    // A provider with no conditional writes cannot refuse one, so a save here
-    // can land on top of somebody else's. Said plainly, because the user is
-    // the only one who can decide whether that matters.
-    if app.cloud.account.as_ref().is_some_and(|a| !a.can(Capability::Etags)) {
-        ui.add_space(4.0);
-        dim(ui, lang.tr("This cloud account cannot detect a save that would overwrite somebody else's changes."));
-    }
-    if asked && ready && app.commit_edit(0, 0, false, false) {
-        let (folder, name) = (app.cloud.mine.path.clone(), app.cloud.save_name.clone());
-        match save_as(app, &folder, &name) {
-            Ok(_) => return true,
-            Err(error) => app.message = Some(("GridCraft".to_owned(), error)),
-        }
-    }
-    false
-}
-
-/// A save refused because the stored copy had moved on.
-///
-/// Three ways out, and none of them throws anything away without saying so.
-/// Reloading is the one a user usually wants, so it comes first. The text says
-/// plainly that it discards their edits.
-pub fn conflict_modal(app: &mut SheetApp, ctx: &egui::Context) {
-    let Some(conflict) = app.cloud.conflict.clone() else { return };
-    let lang = app.ui.language;
-    let mut reload = false;
-    let mut copy = false;
-    let mut dismiss = false;
-    egui::Modal::new(egui::Id::new("cloud_conflict")).show(ctx, |ui| {
-        ui.set_width(430.0);
-        ui.label(RichText::new(lang.tr("This workbook was not saved")).font(theme::ui_bold(15.0)));
-        ui.add_space(8.0);
-        let what = format!(
-            "Somebody else saved {} while you were editing it. Nothing was written: saving now would overwrite their work.",
-            conflict.entry.name
-        );
-        ui.add(egui::Label::new(what).wrap());
-        ui.add_space(6.0);
-        ui.add(egui::Label::new(lang.tr("Your own changes are still open here. Reloading replaces them with the stored copy.")).wrap());
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            reload = ui.button(lang.tr("Reload from the cloud")).clicked();
-            copy = ui.button(lang.tr("Save as a copy…")).clicked();
-            dismiss = ui.button(lang.tr("Keep editing")).clicked();
-        });
-    });
-    if reload {
-        app.cloud.conflict = None;
-        if let Err(error) = reload_active(app) {
-            app.message = Some(("GridCraft".to_owned(), error));
-        }
-    } else if copy {
-        app.cloud.conflict = None;
-        app.cloud.save_name = workbook_name(&format!("{} (copy)", stem_of(&conflict.entry.name)));
-        app.open_backstage(crate::backstage::Page::SaveAs);
-        if let Some(backstage) = &mut app.backstage {
+    fn go_to_save_as(&mut self) {
+        self.open_backstage(crate::backstage::Page::SaveAs);
+        if let Some(backstage) = &mut self.backstage {
             backstage.save_to_cloud = Some(true);
         }
-    } else if dismiss {
-        app.cloud.conflict = None;
     }
-}
 
-/// A file name without its extension.
-fn stem_of(name: &str) -> String {
-    match name.rsplit_once('.') {
-        Some((stem, _)) if !stem.is_empty() => stem.to_owned(),
-        _ => name.to_owned(),
+    fn app_name(&self) -> &str {
+        "GridCraft"
+    }
+
+    fn tr(&self, text: &str) -> String {
+        self.ui.language.tr(text).to_owned()
+    }
+
+    fn service(&self) -> String {
+        service_host()
+    }
+
+    fn save_note(&self) -> Option<String> {
+        Some(self.tr("The workbook is saved as an Excel workbook (.xlsx) in the folder above."))
+    }
+
+    fn style(&self, ui: &Ui) -> craft_ui::cloud::CloudStyle {
+        let t = Tokens::get(ui.ctx());
+        craft_ui::cloud::CloudStyle {
+            surface: t.ribbon,
+            border: t.ribbon_border,
+            text: t.text,
+            dim: t.text_dim,
+            hover: t.hover,
+            soft: t.accent_soft,
+            family: theme::ui_family(),
+            bold: theme::ui_bold_family(),
+        }
     }
 }

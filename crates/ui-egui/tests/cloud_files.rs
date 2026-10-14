@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use egui_kittest::kittest::Queryable as _;
 use gridcraft_engine::Session;
 use gridcraft_engine::core::{CellRef, Value};
-use gridcraft_ui_egui::cloud::{self, Account, Capability, CloudService, Entry, EntryKind, Event, Fault, Job};
+use gridcraft_ui_egui::cloud::{self, Account, Capability, CloudBackend, Entry, EntryKind, Event, Fault, Job, Post};
 use gridcraft_ui_egui::{Services, SheetApp};
 use serde_json::{Value as Json, json};
 
@@ -183,6 +183,18 @@ struct Fake {
     opened_urls: Arc<Mutex<Vec<String>>>,
 }
 
+/// The worker half, answering on the calling thread. A job posted during a
+/// frame is therefore answered before the next one.
+struct Service(Arc<Mutex<State>>);
+
+impl CloudBackend for Service {
+    fn submit(&self, job: Job, post: Post) {
+        for event in self.0.lock().unwrap().answer(job) {
+            post.send(event);
+        }
+    }
+}
+
 /// A sharing service that answers out of a fixed set of people.
 ///
 /// The share dialog is a craft-ui control with its own tests. This exists so
@@ -260,21 +272,9 @@ fn rendering(state: State) -> (Harness, Fake) {
 
 fn build(state: State, rendering: bool) -> (Harness, Fake) {
     let store = Arc::new(Mutex::new(state));
-    let inbox: cloud::Inbox = Arc::new(Mutex::new(Vec::new()));
     let urls = Arc::new(Mutex::new(Vec::new()));
-    let (answering, posting) = (store.clone(), inbox.clone());
     let captured = urls.clone();
-    let services = Services {
-        cloud: Some(CloudService {
-            submit: Box::new(move |job| {
-                let events = answering.lock().unwrap().answer(job);
-                posting.lock().unwrap().extend(events);
-            }),
-            inbox,
-        }),
-        open_url: Some(Box::new(move |url: &str| captured.lock().unwrap().push(url.to_owned()))),
-        ..Default::default()
-    };
+    let services = Services { open_url: Some(Box::new(move |url: &str| captured.lock().unwrap().push(url.to_owned()))), ..Default::default() };
     let mut session = Session::new();
     session.new_workbook();
     let builder = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 900.0));
@@ -290,6 +290,7 @@ fn build(state: State, rendering: bool) -> (Harness, Fake) {
         },
         {
             let mut app = SheetApp::new(session, services);
+            app.cloud.connect(Service(store.clone()));
             // Only a render wants one. A behaviour test that asked for
             // capabilities it never uses would answer a question nobody put.
             if rendering {

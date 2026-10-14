@@ -194,12 +194,6 @@ pub struct Services {
     pub open_async: Option<Box<dyn Fn()>>,
     /// Files delivered asynchronously (name, bytes), opened on the next frame.
     pub inbox: Option<Inbox>,
-    /// Cloud storage, reached through the CollabCraft service. `None` leaves
-    /// the application local-only, and nothing cloud-shaped is offered
-    /// anywhere in the interface. Every call to that service blocks, so the
-    /// host runs them on a worker and answers arrive in an inbox (see
-    /// [`cloud`]).
-    pub cloud: Option<cloud::CloudService>,
     /// Web: hand PDF bytes to the browser's print flow directly (no download,
     /// no intermediate file) — opens the system print dialog on that PDF.
     pub print: Option<Box<dyn Fn(&[u8])>>,
@@ -227,14 +221,16 @@ pub struct SheetApp {
     pub backstage: Option<backstage::Backstage>,
     /// Open and Save against cloud storage: the account, the folder being
     /// browsed, transfers in flight, and where each open document came from.
-    pub cloud: cloud::Cloud,
+    /// The pages are `craft_ui`'s, so every Craft app offers the same ones.
+    /// Inert until the host connects a backend (see [`cloud`]).
+    pub cloud: cloud::CloudFiles,
+    /// The workbook snapshot each cloud save in flight encoded. Only GridCraft
+    /// knows what a version of a workbook is, so the pages do not hold these.
+    pub(crate) cloud_sent: cloud::Sent,
     /// Giving other people access to this workbook. The dialog is `craft-ui`'s,
     /// so every Craft app offers the same one. Inert until the host connects a
     /// backend, and unavailable until that service says sharing exists.
     pub share: craft_ui::share::ShareDialog,
-    /// Who is signed in. Also the only way in, since every cloud control
-    /// is gated on an account being linked.
-    pub account: craft_ui::account::AccountMenu,
     /// Who else is in this document. Draws nothing when nobody is.
     pub presence: craft_ui::presence::PresenceBar,
     pub message: Option<(String, String)>,
@@ -294,9 +290,9 @@ impl SheetApp {
             text_box_editor: None,
             dialog: None,
             backstage: None,
-            cloud: cloud::Cloud::default(),
+            cloud: cloud::CloudFiles::new(),
+            cloud_sent: cloud::Sent::new(),
             share: craft_ui::share::ShareDialog::new(),
-            account: craft_ui::account::AccountMenu::new(),
             presence: craft_ui::presence::PresenceBar::new().badges_only(),
             message: None,
             toast: None,
