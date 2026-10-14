@@ -1,6 +1,8 @@
 //! The browser shell: web `Services`, drag-and-drop, and the eframe web runner.
 
+use craft_cloud::{Entry, EntryKind};
 use gridcraft_engine::Session;
+use gridcraft_ui_egui::cloud::{self, open_entry};
 use gridcraft_ui_egui::{Inbox, Services, SheetApp};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::JsValue;
@@ -48,6 +50,11 @@ pub fn start() {
                         bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone());
                     }
                     let mut app = SheetApp::new(session, services);
+                    app.cloud.connect(crate::cloud::Service::new(cc.egui_ctx.clone()));
+                    if let Some(share) = collabcraft_share::CollabCraft::from_env() {
+                        app.share.connect(share);
+                    }
+                    cloud::start(&mut app);
                     app.ui.system_theme = true;
                     // Follow the browser's language, except a CJK one: the web build has no system
                     // CJK fonts (none are bundled), so that interface would render as tofu.
@@ -65,7 +72,8 @@ pub fn start() {
                         }
                         bridge.post_ready();
                     }
-                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge }))
+                    let pending_file = query_param("file");
+                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge, pending_file, opened_file: false }))
                 }),
             )
             .await;
@@ -93,6 +101,9 @@ struct WebShell {
     app: SheetApp,
     inbox: Inbox,
     bridge: Option<crate::host::Bridge>,
+    /// Nextcloud file handle from `?file=`, opened once the account arrives.
+    pending_file: Option<String>,
+    opened_file: bool,
 }
 
 impl eframe::App for WebShell {
@@ -113,6 +124,32 @@ impl eframe::App for WebShell {
             });
         }
         self.app.logic(ctx);
+        if !self.opened_file {
+            if let Some(id) = self.pending_file.clone() {
+                if self.app.cloud.account.as_ref().is_some_and(|a| a.provider_linked) {
+                    self.opened_file = true;
+                    open_entry(
+                        &mut self.app,
+                        Entry {
+                            id,
+                            room: String::new(),
+                            name: "workbook.xlsx".to_owned(),
+                            path: String::new(),
+                            kind: EntryKind::File,
+                            size: None,
+                            modified: None,
+                            mime: Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_owned()),
+                            etag: None,
+                            writable: true,
+                            shared_by: None,
+                        },
+                        None,
+                    );
+                }
+            } else if self.app.cloud.account.is_some() {
+                self.opened_file = true;
+            }
+        }
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {

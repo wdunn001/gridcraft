@@ -99,13 +99,22 @@ pub fn copies() -> Vec<CopyFormat> {
 /// deployment-specific. Somebody with an account on two deployments needs to
 /// know which one a workbook is about to land in.
 fn service_host() -> String {
-    ["GRIDCRAFT_CLOUD_URL", "CRAFT_CLOUD_URL", "COLLABCRAFT_URL"]
-        .into_iter()
-        .filter_map(|key| std::env::var(key).ok())
-        .map(|value| value.trim().trim_end_matches('/').to_owned())
-        .find(|value| !value.is_empty())
-        .map(|value| value.trim_start_matches("https://").trim_start_matches("http://").to_owned())
-        .unwrap_or_default()
+    #[cfg(target_arch = "wasm32")]
+    {
+        return web_sys::window()
+            .and_then(|w| w.location().host().ok())
+            .unwrap_or_default();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        ["GRIDCRAFT_CLOUD_URL", "CRAFT_CLOUD_URL", "COLLABCRAFT_URL"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .map(|value| value.trim().trim_end_matches('/').to_owned())
+            .find(|value| !value.is_empty())
+            .map(|value| value.trim_start_matches("https://").trim_start_matches("http://").to_owned())
+            .unwrap_or_default()
+    }
 }
 
 /// The format a save should be written in, when the name cannot say.
