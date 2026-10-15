@@ -52,7 +52,7 @@ pub fn start() {
                     let mut app = SheetApp::new(session, services);
                     app.cloud.connect(crate::cloud::Service::new(cc.egui_ctx.clone()));
                     if let Some(share) = collabcraft_share::CollabCraft::from_env() {
-                        app.share.connect(share);
+                        app.share.connect(share.for_app("gridcraft"));
                     }
                     cloud::start(&mut app);
                     app.ui.system_theme = true;
@@ -211,6 +211,14 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
                 && let gridcraft_engine::links::LinkKind::External(url) = gridcraft_engine::links::classify(url)
             {
                 let _ = w.open_with_url_and_target(&url, "_blank");
+            }
+        })),
+        open_conversation: Some(Box::new(|url: &str| {
+            if let Some(w) = web_sys::window()
+                && let gridcraft_engine::links::LinkKind::External(url) = gridcraft_engine::links::classify(url)
+                && let Err(e) = w.location().assign(&url)
+            {
+                log::warn!("could not open conversation: {e:?}");
             }
         })),
         inbox: Some(inbox),

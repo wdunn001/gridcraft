@@ -177,6 +177,10 @@ pub struct Services {
     /// insert into a subsequent dialog or open the image as a workbook.
     pub pick_picture_async: Option<Box<dyn Fn(Inbox)>>,
     pub open_url: Option<Box<dyn Fn(&str)>>,
+    /// Open a document's provider chat. Web hosts navigate the current tab
+    /// because the URL arrives after an asynchronous lookup, when popup
+    /// blockers reject a new window. Desktop hosts hand it to the OS.
+    pub open_conversation: Option<Box<dyn Fn(&str)>>,
     /// Publish HTML and its plain-text alternative together. `Ok` means the host owns the
     /// write (including any asynchronous fallback); an immediate error uses egui's text path.
     pub copy_html: Option<Box<dyn FnMut(&str, &str) -> Result<(), String>>>,

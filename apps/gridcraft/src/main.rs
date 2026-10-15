@@ -218,6 +218,7 @@ fn services() -> Services {
             dialog.save_file().and_then(|p| p.to_str().map(str::to_string))
         })),
         open_url: Some(Box::new(|url: &str| open_with_system(url))),
+        open_conversation: Some(Box::new(|url: &str| open_with_system(url))),
         printers: Some(print::discover()),
         print_native: Some(print::submit()),
         ..Default::default()
@@ -384,7 +385,7 @@ fn main() -> eframe::Result<()> {
                 if let Some(backend) = cloud::service(cc.egui_ctx.clone()) {
                     app.cloud.connect(backend);
                 }
-                app.share.connect(collabcraft_share::CollabCraft::from_fn(cloud::client));
+                app.share.connect(collabcraft_share::CollabCraft::from_fn(cloud::client).for_app("gridcraft"));
                 if let Some(port) = control_port {
                     match control_server::start(port, cc.egui_ctx.clone()) {
                         Ok(rx) => app.control_rx = Some(rx),

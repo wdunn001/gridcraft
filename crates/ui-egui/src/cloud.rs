@@ -239,6 +239,14 @@ impl CloudApp for SheetApp {
         }
     }
 
+    fn open_conversation(&self, url: &str) {
+        if let Some(open) = &self.services.open_conversation {
+            open(url);
+        } else {
+            self.open_url(url);
+        }
+    }
+
     fn say(&mut self, text: String) {
         self.message = Some(("GridCraft".to_owned(), text));
     }
