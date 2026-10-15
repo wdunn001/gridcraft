@@ -101,9 +101,7 @@ pub fn copies() -> Vec<CopyFormat> {
 fn service_host() -> String {
     #[cfg(target_arch = "wasm32")]
     {
-        return web_sys::window()
-            .and_then(|w| w.location().host().ok())
-            .unwrap_or_default();
+        return web_sys::window().and_then(|w| w.location().host().ok()).unwrap_or_default();
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
