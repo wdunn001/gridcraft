@@ -75,3 +75,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 16
 debug = 0
+
+# PlacesPanel lives on craft-libs places-on-cloud, a sibling of this checkout.
+# The GitHub pin stays on the crates so Cargo.lock still names a revision;
+# this patch is what the laptop and the .57 wasm build actually compile.
+[patch."https://github.com/wdunn001/craft-libs"]
+craft-ui = { path = "../gh-craft-libs/crates/ui" }
+craft-cloud = { path = "../gh-craft-libs/crates/cloud" }

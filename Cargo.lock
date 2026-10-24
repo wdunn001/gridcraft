@@ -853,7 +853,6 @@ dependencies = [
 [[package]]
 name = "craft-cloud"
 version = "0.1.0"
-source = "git+https://github.com/wdunn001/craft-libs?rev=3aa7841deee2f9919a4dcca55487db5063293654#3aa7841deee2f9919a4dcca55487db5063293654"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -914,7 +913,6 @@ dependencies = [
 [[package]]
 name = "craft-ui"
 version = "0.1.0"
-source = "git+https://github.com/wdunn001/craft-libs?rev=3aa7841deee2f9919a4dcca55487db5063293654#3aa7841deee2f9919a4dcca55487db5063293654"
 dependencies = [
  "craft-cloud",
  "egui",
