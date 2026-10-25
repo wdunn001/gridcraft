@@ -270,6 +270,18 @@ impl CloudApp for SheetApp {
         Some(self.tr("The workbook is saved as an Excel workbook (.xlsx) in the folder above."))
     }
 
+    fn recents(&self) -> Vec<String> {
+        self.ui.recent.iter().cloned().collect()
+    }
+
+    fn open_recent(&mut self, path: &str) {
+        self.open_path(path);
+    }
+
+    fn browse_local(&mut self) {
+        self.open_dialog("open", json!({}));
+    }
+
     fn style(&self, ui: &Ui) -> craft_ui::cloud::CloudStyle {
         let t = Tokens::get(ui.ctx());
         craft_ui::cloud::CloudStyle {
