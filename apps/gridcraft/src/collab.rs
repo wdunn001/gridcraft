@@ -1,14 +1,16 @@
-//! Shared editing for GridCraft, over the CraftCollab relay.
-//!
-//! The merge and the socket live in [`craft_collab`]. This file maps a cell address to a CRDT
-//! text unit: `cell.set` is lock-free, everything else still takes a region lock. Desktop uses
-//! [`craft_collab::native::NativeHub`]; the browser crate includes this file and uses
-//! [`craft_collab::web::WebHub`].
+// Shared editing for GridCraft, over the CraftCollab relay.
+//
+// The merge and the socket live in craft_collab. This file maps a cell address to a CRDT
+// text unit: cell.set is lock-free, everything else still takes a region lock. Desktop uses
+// NativeHub; the browser crate includes this file and uses WebHub.
+// Written as ordinary comments so include! from gridcraft-web is valid.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use craft_collab::{Live, Work, doc_from_token};
+use craft_collab::{Live, Work};
+#[cfg(not(target_arch = "wasm32"))]
+use craft_collab::doc_from_token;
 use gridcraft_engine::{CollabSink, Session as Engine};
 use serde_json::{Value as Json, json};
 
