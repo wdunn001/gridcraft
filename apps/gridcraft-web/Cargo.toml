@@ -16,11 +16,11 @@ path = "src/main.rs"
 [dependencies]
 gridcraft-engine = { workspace = true }
 gridcraft-ui-egui = { workspace = true }
-craft-cloud = { git = "https://github.com/wdunn001/craft-libs", rev = "3aa7841deee2f9919a4dcca55487db5063293654" }
-craft-cloud-client = { git = "https://github.com/wdunn001/collab-craft", rev = "4a49dc5" }
-collabcraft-share = { git = "https://github.com/wdunn001/collab-craft", rev = "82c339c" }
-craft-collab = { git = "https://github.com/wdunn001/collab-craft", rev = "4a49dc5", features = ["web-hub"] }
-craft-ui = { git = "https://github.com/wdunn001/craft-libs", rev = "3aa7841deee2f9919a4dcca55487db5063293654", features = ["cloud"] }
+craft-cloud = {git = "https://github.com/wdunn001/craft-libs", branch = "quasarke"}
+craft-cloud-client = {git = "https://github.com/wdunn001/collab-craft", branch = "quasarke"}
+collabcraft-share = {git = "https://github.com/wdunn001/collab-craft", branch = "quasarke"}
+craft-collab = {git = "https://github.com/wdunn001/collab-craft", branch = "quasarke", features = ["web-hub"]}
+craft-ui = {git = "https://github.com/wdunn001/craft-libs", branch = "quasarke", features = ["cloud"]}
 egui = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
