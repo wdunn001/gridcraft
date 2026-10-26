@@ -17,17 +17,17 @@ gridcraft-ui-egui = { workspace = true }
 # reaches craft-print and craft-ui. A sibling path would only resolve where
 # somebody has checked craft-libs out beside this one. The relay protocol lives
 # there, so every Craft app speaks the same wire format.
-craft-collab = { git = "https://github.com/wdunn001/collab-craft", rev = "4a49dc5", features = ["native-hub"] }
+craft-collab = {git = "https://github.com/wdunn001/collab-craft", branch = "quasarke", features = ["native-hub"]}
 # How this app reaches CollabCraft. No provider credential, no provider URL
 # and no provider protocol live in here.
-craft-cloud-client = { git = "https://github.com/wdunn001/collab-craft", rev = "82c339c" }
+craft-cloud-client = {git = "https://github.com/wdunn001/collab-craft", branch = "quasarke"}
 # The share dialog's backend. The dialog is drawn by gridcraft-ui-egui, which
 # opens no socket; this feature is the half that reaches CollabCraft, and it
 # lives here because the session this application collects lives here too.
-craft-ui = { git = "https://github.com/wdunn001/craft-libs", rev = "3aa7841deee2f9919a4dcca55487db5063293654", features = ["cloud"] }
+craft-ui = {git = "https://github.com/wdunn001/craft-libs", branch = "quasarke", features = ["cloud"]}
 # The half that opens a socket. craft-ui states the work and nothing in
 # craft-libs answers it, so the backend comes from beside the client.
-collabcraft-share = { git = "https://github.com/wdunn001/collab-craft", rev = "82c339c" }
+collabcraft-share = {git = "https://github.com/wdunn001/collab-craft", branch = "quasarke"}
 # Only the relay client is async, and NativeHub needs a runtime to live on.
 tokio = { version = "1", features = ["rt-multi-thread"] }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11"] }
@@ -41,7 +41,7 @@ image = { workspace = true }
 winresource = "0.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-craft-print = { git = "https://github.com/storytold/craft-libs", rev = "d27646a5f7c8b4fc85d9dd3213b8c88b58e0088d" }
+craft-print = {git = "https://github.com/wdunn001/craft-libs", branch = "quasarke"}
 rfd = { workspace = true }
 arboard = { workspace = true }
 
