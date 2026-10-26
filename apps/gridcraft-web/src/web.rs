@@ -78,9 +78,7 @@ pub fn start() {
                         app.share.connect(share.for_app("gridcraft"));
                     }
                     let invited = invite.is_some();
-                    if let Some(invitation) = invite.take() {
-                        open_invite(&mut app, invitation);
-                    }
+                    let collab = invite.take().and_then(|invitation| open_invite(&mut app, invitation));
                     app.ui.system_theme = true;
                     // Follow the browser's language, except a CJK one: the web build has no system
                     // CJK fonts (none are bundled), so that interface would render as tofu.
@@ -114,6 +112,7 @@ pub fn start() {
                         file_stat_started: false,
                         opened_file: false,
                         prefs,
+                        collab,
                     }))
                 }),
             )
@@ -130,23 +129,34 @@ pub fn start() {
     });
 }
 
-fn open_invite(app: &mut SheetApp, invitation: craft_cloud_client::invite::Invitation) {
+fn open_invite(app: &mut SheetApp, invitation: craft_cloud_client::invite::Invitation) -> Option<crate::collab::Link> {
     let name = invitation.name.clone();
     match gridcraft_ui_egui::cloud::CloudApp::open_bytes(app, &name, invitation.document.clone()) {
         Ok(Some(_)) => {
             let mode = if invitation.read_only() { " (view only)" } else { "" };
             let who = if invitation.recipient.is_empty() { String::new() } else { format!(" (shared with {})", invitation.recipient) };
             app.message = Some(("GridCraft".into(), format!("Opened \"{name}\"{mode}{who}")));
-            if let Err(e) = invitation.join() {
-                log::warn!("invite relay join failed: {e}");
+            match invitation.join() {
+                Ok(hub) => {
+                    let mut link = crate::collab::Link::from_web(hub, invitation.room());
+                    let uid = app.session.active().map(|d| d.uid);
+                    link.bind(&mut app.session, uid);
+                    Some(link)
+                }
+                Err(e) => {
+                    log::warn!("invite relay join failed: {e}");
+                    None
+                }
             }
         }
         Ok(None) => {
             app.message = Some(("GridCraft".into(), format!("Shared \"{name}\" needs a choice before it opens")));
+            None
         }
         Err(e) => {
             log::error!("invite open failed: {e}");
             craft_cloud_client::invite::refuse(&format!("The shared workbook could not be opened. {e}"));
+            None
         }
     }
 }
@@ -170,6 +180,7 @@ struct WebShell {
     file_stat_started: bool,
     opened_file: bool,
     prefs: crate::prefs::PrefsSync,
+    collab: Option<crate::collab::Link>,
 }
 
 fn local_storage() -> Option<web_sys::Storage> {
@@ -197,6 +208,21 @@ impl eframe::App for WebShell {
                     Err(e) => log::error!("couldn't read dropped file {name}: {e}"),
                 }
             });
+        }
+        if let Some(link) = &mut self.collab {
+            if self.app.session.collab.is_none() {
+                if let Some(uid) = self.app.session.active().map(|d| d.uid) {
+                    link.bind(&mut self.app.session, Some(uid));
+                }
+            }
+            if self.app.session.collab.is_some() {
+                link.pump(&mut self.app.session);
+                self.app.presence.set(link.roster.iter().map(|(id, display)| craft_ui::presence::Peer::new(id.clone(), display.clone())).collect());
+                for notice in std::mem::take(&mut link.notices) {
+                    self.app.toast = Some((notice, gridcraft_ui_egui::now_ms()));
+                }
+                ctx.request_repaint_after(std::time::Duration::from_millis(120));
+            }
         }
         self.app.logic(ctx);
         if !self.opened_file {

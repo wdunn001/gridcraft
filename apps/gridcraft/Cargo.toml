@@ -17,7 +17,7 @@ gridcraft-ui-egui = { workspace = true }
 # reaches craft-print and craft-ui. A sibling path would only resolve where
 # somebody has checked craft-libs out beside this one. The relay protocol lives
 # there, so every Craft app speaks the same wire format.
-craft-collab = { git = "https://github.com/wdunn001/collab-craft", rev = "82c339c", features = ["native-hub"] }
+craft-collab = { git = "https://github.com/wdunn001/collab-craft", rev = "4a49dc5", features = ["native-hub"] }
 # How this app reaches CollabCraft. No provider credential, no provider URL
 # and no provider protocol live in here.
 craft-cloud-client = { git = "https://github.com/wdunn001/collab-craft", rev = "82c339c" }

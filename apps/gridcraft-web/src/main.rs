@@ -18,6 +18,8 @@
 #[cfg(target_arch = "wasm32")]
 mod cloud;
 #[cfg(target_arch = "wasm32")]
+mod collab;
+#[cfg(target_arch = "wasm32")]
 mod host;
 #[cfg(any(target_arch = "wasm32", test))]
 mod prefs;
