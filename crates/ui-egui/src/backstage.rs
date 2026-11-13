@@ -608,9 +608,18 @@ fn new_page(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome) {
     new_tiles(app, ui, out);
 }
 
-fn open_page(app: &mut SheetApp, ui: &mut Ui, _bs: &mut Backstage, out: &mut Outcome) {
+fn open_page(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcome) {
+    let lang = app.ui.language;
     let before = app.session.active().map(|d| d.uid);
+    if square_button(ui, Icon::OpenFolder, lang.tr("Browse…")).clicked() {
+        app.open_dialog("open", json!({}));
+    }
+    ui.add_space(22.0);
+    section(ui, lang, "Recent");
+    recent_list(app, ui, bs, out, usize::MAX);
+    ui.add_space(22.0);
     cloud::open_page(app, ui);
+    // Desktop pickers return at once; the web picker delivers later (see `SheetApp::logic`).
     if app.session.active().map(|d| d.uid) != before {
         out.close = true;
     }

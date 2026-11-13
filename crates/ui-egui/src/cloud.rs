@@ -27,7 +27,7 @@ pub use craft_cloud::{Capability, Entry, EntryKind};
 pub use craft_ui::cloud::{
     Account, Busy, CloudApp, CloudBackend, CloudFiles, Conflict, CopyFormat, Destination, DocumentKind, Event, Fault, Folder, Job, Link, Origin,
     Post, Source, UNAVAILABLE, available, browse, can_converse, conflict_modal, destination_name, has_target, link, load_shared, open_entry,
-    open_page, origin, parent_of, prefers_cloud, progress, pump, reload_active, retry_account, save, save_as, save_page, share_button, shares,
+    open_page, origin, parent_of, prefers_cloud, progress, pump, reload_active, save, save_as, save_page, share_button, shares,
     sign_in, sign_out, start, who, work_together,
 };
 use egui::{Color32, Painter, Rect, Ui};
@@ -268,18 +268,6 @@ impl CloudApp for SheetApp {
 
     fn save_note(&self) -> Option<String> {
         Some(self.tr("The workbook is saved as an Excel workbook (.xlsx) in the folder above."))
-    }
-
-    fn recents(&self) -> Vec<String> {
-        self.ui.recent.iter().cloned().collect()
-    }
-
-    fn open_recent(&mut self, path: &str) {
-        self.open_path(path);
-    }
-
-    fn browse_local(&mut self) {
-        self.open_dialog("open", json!({}));
     }
 
     fn style(&self, ui: &Ui) -> craft_ui::cloud::CloudStyle {

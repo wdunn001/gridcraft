@@ -49,6 +49,18 @@ impl Service {
                 });
                 post(Event::Account(answer));
             }
+            Job::SignIn => {
+                // The browser build signs in by navigating to the service's login page; the page
+                // comes back signed in, and the fresh page asks for the account itself. Already
+                // signed in, the answer unsticks the working badge.
+                match self.me().await {
+                    Ok(me) => {
+                        post(Event::Account(Ok(Account { display: me.display, capabilities: me.capabilities, provider_linked: me.provider_linked })))
+                    }
+                    Err(Fault::Unauthenticated) => offer_login(),
+                    Err(fault) => post(Event::Account(Err(fault))),
+                }
+            }
             Job::LinkStart => match self.client.link_start().await.map_err(fault) {
                 Ok(start) => post(Event::Browser { url: start.login_url, handle: Some(start.handle) }),
                 Err(fault) => post(Event::Linked(Err(fault))),
@@ -113,6 +125,16 @@ fn fault(e: Error) -> Fault {
             Fault::Refused("GridCraft could not build that request".to_owned())
         }
     }
+}
+
+/// Navigates to the service's login page, unless this already is one of its pages.
+fn offer_login() {
+    let Some(window) = web_sys::window() else { return };
+    let Ok(path) = window.location().pathname() else { return };
+    if path.starts_with("/auth/") {
+        return;
+    }
+    let _ = window.location().set_href("/auth/login");
 }
 
 async fn fetch_logout() -> Result<(), String> {
