@@ -21,6 +21,10 @@ craft-cloud-client = {git = "https://github.com/wdunn001/collab-craft", branch =
 collabcraft-share = {git = "https://github.com/wdunn001/collab-craft", branch = "quasarke"}
 craft-collab = {git = "https://github.com/wdunn001/collab-craft", branch = "quasarke", features = ["web-hub"]}
 craft-ui = {git = "https://github.com/wdunn001/craft-libs", branch = "quasarke", features = ["cloud"]}
+# The host messages (craft-libs): one contract and one bridge for the web builds.
+# The page command API (craft-libs#413): window.gridcraft over the control channel.
+craft-web-api = { git = "https://github.com/wdunn001/craft-libs", branch = "quasarke", version = "0.1.0" }
+craft-web-host = { git = "https://github.com/wdunn001/craft-libs", branch = "quasarke", version = "0.1.0" }
 egui = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
@@ -31,4 +35,4 @@ rfd = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlElement", "HtmlCanvasElement", "HtmlAnchorElement", "HtmlIFrameElement", "Blob", "BlobPropertyBag", "Url", "Location", "CssStyleDeclaration", "Clipboard", "ClipboardItem", "Navigator", "MessageEvent", "UrlSearchParams", "Request", "RequestInit", "RequestCredentials", "AddEventListenerOptions", "Storage"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "Event", "EventTarget", "HtmlElement", "HtmlCanvasElement", "HtmlAnchorElement", "HtmlIFrameElement", "Blob", "BlobPropertyBag", "Url", "Location", "CssStyleDeclaration", "Clipboard", "ClipboardItem", "Navigator", "MessageEvent", "UrlSearchParams", "Request", "RequestInit", "RequestCredentials", "AddEventListenerOptions", "Storage", "CustomEvent", "CustomEventInit"] }
